@@ -124,10 +124,11 @@ export async function POST() {
             let adjustedConfidence = extractionResult.confidence + (validation.confidenceAdjustment || 0);
             adjustedConfidence = Math.max(0, Math.min(1, adjustedConfidence));
 
-            const processingNotes = [
-              ...validation.notes,
-              `Confidence: ${(adjustedConfidence * 100).toFixed(0)}%`,
-            ].join('; ');
+            // Filter out empty or meaningless notes and join
+            const meaningfulNotes = validation.notes.filter(note =>
+              note && note.trim().length > 2 && !/^[A-Za-z]\.?$/.test(note.trim())
+            );
+            const processingNotes = meaningfulNotes.join('; ');
 
             await submitProcessedInvoice({
               fileName,

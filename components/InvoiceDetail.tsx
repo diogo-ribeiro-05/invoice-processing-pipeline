@@ -39,9 +39,9 @@ function getValidationStatus(notes: string): 'matched' | 'flagged' {
 // Parse processing notes into individual messages
 function parseProcessingNotes(notes: string): string[] {
   if (!notes) return [];
-  // Split by semicolons, periods followed by space, or just periods at the end
+  // Split only by semicolons (not periods - they're part of company names like B.V., Ltd.)
   return notes
-    .split(/[;.]/)
+    .split(';')
     .map(n => n.trim())
     .filter(n => n.length > 0);
 }
