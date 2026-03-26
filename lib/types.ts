@@ -73,8 +73,7 @@ export interface DashboardStats {
   totalInvoices: number;
   matchedVendors: number;
   flaggedIssues: number;
-  totalAmount: number;
-  currency: string;
+  totalsByCurrency: { currency: string; amount: number }[];
 }
 
 // Processing Status for UI

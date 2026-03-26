@@ -1,4 +1,4 @@
-import type { Company, ProcessedInvoice, DeleteResponse } from './types';
+import type { Company, ProcessedInvoice, DeleteResponse, ExtractedData } from './types';
 
 const ERP_API_BASE_URL = process.env.ERP_API_BASE_URL || 'https://backend-production-4c89.up.railway.app/api/erp';
 const ERP_API_KEY = process.env.ERP_API_KEY || '';
@@ -33,7 +33,7 @@ export async function getProcessedInvoices(): Promise<{ items: ProcessedInvoice[
 
 export async function submitProcessedInvoice(invoice: {
   fileName: string;
-  extractedData: Record<string, unknown>;
+  extractedData: Record<string, unknown> | ExtractedData;
   confidenceScore?: number;
   processingNotes?: string;
 }): Promise<ProcessedInvoice> {

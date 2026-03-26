@@ -26,8 +26,7 @@ export default function DashboardPage() {
     totalInvoices: 0,
     matchedVendors: 0,
     flaggedIssues: 0,
-    totalAmount: 0,
-    currency: 'EUR',
+    totalsByCurrency: [],
   });
 
   const fetchInvoices = useCallback(async () => {
@@ -52,17 +51,25 @@ export default function DashboardPage() {
       // Everything else is flagged
       const flagged = total - matched;
 
-      const totalAmount = data.items?.reduce((sum: number, inv: ProcessedInvoice) => {
+      // Calculate totals by currency
+      const currencyTotals = new Map<string, number>();
+      data.items?.forEach((inv: ProcessedInvoice) => {
         const amount = inv.extractedData?.totalAmount as number;
-        return sum + (typeof amount === 'number' ? amount : 0);
-      }, 0) || 0;
+        const currency = (inv.extractedData?.currency as string) || 'EUR';
+        if (typeof amount === 'number') {
+          currencyTotals.set(currency, (currencyTotals.get(currency) || 0) + amount);
+        }
+      });
+
+      const totalsByCurrency = Array.from(currencyTotals.entries())
+        .map(([currency, amount]) => ({ currency, amount }))
+        .sort((a, b) => b.amount - a.amount);
 
       setStats({
         totalInvoices: total,
         matchedVendors: matched,
         flaggedIssues: flagged,
-        totalAmount,
-        currency: 'EUR',
+        totalsByCurrency,
       })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load invoices')
@@ -172,13 +179,17 @@ export default function DashboardPage() {
     }
   }
 
-  const formatTotalAmount = (amount: number) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: stats.currency,
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(amount)
+  const formatCurrency = (amount: number, currency: string) => {
+    try {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: currency || 'EUR',
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(amount);
+    } catch {
+      return `${currency} ${amount.toFixed(2)}`;
+    }
   }
 
   const progressPercent = progress ? Math.round((progress.current / progress.total) * 100) : 0
@@ -279,12 +290,29 @@ export default function DashboardPage() {
             color="yellow"
           />
           <StatsCard
-            title="Total Amount"
-            value={formatTotalAmount(stats.totalAmount)}
-            subtitle="all invoices"
+            title="Totals by Currency"
+            value={stats.totalsByCurrency.length > 0 ? '' : '—'}
+            subtitle={stats.totalsByCurrency.length > 0 ? undefined : 'no data'}
             color="gray"
           />
         </div>
+
+        {/* Currency Breakdown */}
+        {stats.totalsByCurrency.length > 0 && (
+          <div className="mb-8 rounded-lg border border-gray-200 bg-white p-6">
+            <h3 className="mb-4 text-sm font-medium text-gray-500">Amounts by Currency</h3>
+            <div className="flex flex-wrap gap-6">
+              {stats.totalsByCurrency.map(({ currency, amount }) => (
+                <div key={currency} className="flex items-baseline gap-2">
+                  <span className="text-2xl font-bold text-gray-900">
+                    {formatCurrency(amount, currency)}
+                  </span>
+                  <span className="text-sm text-gray-500">{currency}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Invoices Table */}
         <div className="relative">
