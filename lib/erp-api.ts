@@ -107,7 +107,6 @@ export function validateVendor(
   let taxIdMatched = false;
   let mathError = false;
   let matchedCompanyId: string | undefined;
-  let confidenceAdjustment = 0;
 
   // Handle null/undefined/empty values
   const safeVendorName = vendorName?.trim() || '';
@@ -122,7 +121,7 @@ export function validateVendor(
       mathError: false,
       matchedCompanyId: undefined,
       notes: ['Vendor name is empty or missing from invoice'],
-      confidenceAdjustment: -0.5,
+      confidenceAdjustment: -0.5, // 50% confidence
     };
   }
 
@@ -136,7 +135,6 @@ export function validateVendor(
     if (mathCheck.hasError) {
       mathError = true;
       notes.push(mathCheck.message);
-      confidenceAdjustment -= 0.2;
     }
   }
 
@@ -144,7 +142,6 @@ export function validateVendor(
   const taxIdMissing = !safeVendorTaxId;
   if (taxIdMissing) {
     notes.push('Tax ID is missing from invoice');
-    confidenceAdjustment -= 0.3;
   }
 
   // Try to find company by tax ID first (more reliable)
@@ -201,6 +198,37 @@ export function validateVendor(
 
   if (status === 'matched') {
     notes.push('Vendor fully validated');
+  }
+
+  // Calculate confidence adjustment based on specific conditions
+  let confidenceAdjustment = 0;
+
+  if (status === 'matched') {
+    // Fully validated - keep 100% confidence (no adjustment needed)
+    confidenceAdjustment = 0;
+  } else {
+    // Flagged - calculate confidence based on what matched
+    if (vendorMatched && taxIdMissing) {
+      // Vendor matched but tax ID is missing from invoice - still pretty confident
+      confidenceAdjustment = -0.15; // 85% confidence
+    } else if (vendorMatched && !taxIdMatched && !taxIdMissing) {
+      // Vendor matched but tax ID doesn't match records - less confident
+      confidenceAdjustment = -0.25; // 75% confidence
+    } else if (!vendorMatched && taxIdMatched) {
+      // Vendor not found but tax ID matched - fairly confident
+      confidenceAdjustment = -0.20; // 80% confidence
+    } else if (!vendorMatched && taxIdMissing) {
+      // Neither vendor nor tax ID found - low confidence
+      confidenceAdjustment = -0.50; // 50% confidence
+    } else {
+      // Default for other flagged cases
+      confidenceAdjustment = -0.30; // 70% confidence
+    }
+
+    // Additional penalty for math error
+    if (mathError) {
+      confidenceAdjustment -= 0.10; // Additional 10% penalty
+    }
   }
 
   return {
