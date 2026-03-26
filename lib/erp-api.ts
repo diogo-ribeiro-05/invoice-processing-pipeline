@@ -215,13 +215,14 @@ export function validateVendor(
       // Vendor matched but tax ID doesn't match records - less confident
       confidenceAdjustment = -0.25; // 75% confidence
     } else if (!vendorMatched && taxIdMatched) {
-      // Vendor not found but tax ID matched - fairly confident
+      // Vendor not found but tax ID matched - fairly confident (tax ID is reliable)
       confidenceAdjustment = -0.20; // 80% confidence
-    } else if (!vendorMatched && taxIdMissing) {
-      // Neither vendor nor tax ID found - low confidence
+    } else if (!vendorMatched && !taxIdMatched) {
+      // Neither vendor nor tax ID found in records - LOW confidence
+      // This applies whether tax ID is missing or present but not found
       confidenceAdjustment = -0.50; // 50% confidence
     } else {
-      // Default for other flagged cases
+      // Fallback for any other flagged cases
       confidenceAdjustment = -0.30; // 70% confidence
     }
 
