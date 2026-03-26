@@ -270,7 +270,7 @@ export default function DashboardPage() {
         )}
 
         {/* Stats Grid */}
-        <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <StatsCard
             title="Total Invoices"
             value={stats.totalInvoices}
@@ -289,18 +289,12 @@ export default function DashboardPage() {
             subtitle="need attention"
             color="yellow"
           />
-          <StatsCard
-            title="Totals by Currency"
-            value={stats.totalsByCurrency.length > 0 ? '' : '—'}
-            subtitle={stats.totalsByCurrency.length > 0 ? undefined : 'no data'}
-            color="gray"
-          />
         </div>
 
         {/* Currency Breakdown */}
         {stats.totalsByCurrency.length > 0 && (
           <div className="mb-8 rounded-lg border border-gray-200 bg-white p-6">
-            <h3 className="mb-4 text-sm font-medium text-gray-500">Amounts by Currency</h3>
+            <h3 className="mb-4 text-sm font-medium text-gray-500">Total Amounts by Currency</h3>
             <div className="flex flex-wrap gap-6">
               {stats.totalsByCurrency.map(({ currency, amount }) => (
                 <div key={currency} className="flex items-baseline gap-2">
