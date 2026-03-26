@@ -49,6 +49,11 @@ export async function deleteAllProcessedInvoices(): Promise<DeleteResponse> {
   });
 }
 
+// Normalize tax ID by removing spaces, dots, dashes and converting to uppercase
+function normalizeTaxId(taxId: string): string {
+  return taxId.replace(/[\s.\-]/g, '').toUpperCase();
+}
+
 // Vendor validation helper
 export function validateVendor(
   vendorName: string | null | undefined,
@@ -83,8 +88,9 @@ export function validateVendor(
 
   // Try to find company by tax ID first (more reliable)
   if (safeVendorTaxId) {
+    const normalizedInvoiceTaxId = normalizeTaxId(safeVendorTaxId);
     const companyByTaxId = companies.find(
-      (c) => c.taxId.toLowerCase() === safeVendorTaxId.toLowerCase()
+      (c) => normalizeTaxId(c.taxId) === normalizedInvoiceTaxId
     );
 
     if (companyByTaxId) {
@@ -113,9 +119,13 @@ export function validateVendor(
     }
     if (!taxIdMatched) {
       notes.push(`Vendor name matched to company: ${companyByName.name}`);
-      // Check if tax IDs differ
-      if (safeVendorTaxId && companyByName.taxId.toLowerCase() !== safeVendorTaxId.toLowerCase()) {
-        notes.push(`Warning: Tax ID mismatch. Invoice: ${safeVendorTaxId}, Record: ${companyByName.taxId}`);
+      // Check if tax IDs differ (normalized comparison)
+      if (safeVendorTaxId) {
+        const normalizedInvoiceTaxId = normalizeTaxId(safeVendorTaxId);
+        const normalizedCompanyTaxId = normalizeTaxId(companyByName.taxId);
+        if (normalizedInvoiceTaxId !== normalizedCompanyTaxId) {
+          notes.push(`Warning: Tax ID mismatch. Invoice: ${safeVendorTaxId}, Record: ${companyByName.taxId}`);
+        }
       }
     }
   }

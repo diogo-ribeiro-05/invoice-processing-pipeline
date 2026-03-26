@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import pdf from 'pdf-parse';
 import type { ExtractedData } from './types';
 
 const anthropic = new Anthropic({
@@ -8,21 +9,22 @@ const anthropic = new Anthropic({
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
-const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice PDF.
+const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice text.
 
 IMPORTANT INSTRUCTIONS:
-1. Extract ALL available information from the invoice
+1. Extract ALL available information from the invoice text below
 2. Handle multiple languages (English, Dutch, French, German)
 3. Handle multiple currencies (USD, EUR, INR, etc.)
 4. If a field is not found, use null or empty string
 5. For amounts, extract the numeric value only (no currency symbols)
 6. For dates, use ISO 8601 format (YYYY-MM-DD)
-7. Be precise with vendor names and tax IDs
+7. Be precise with vendor names - extract the exact company name that issued the invoice
+8. Look for the "from" or "seller" or "vendor" section to identify the company name
 
 Extract the following fields:
 - invoiceNumber: The invoice/document number
-- vendorName: Full company/vendor name as shown
-- vendorTaxId: Tax ID (VAT number, GSTIN, etc.) - include the country prefix if present (e.g., "US-XXX", "DE-XXX")
+- vendorName: Full company/vendor name as shown (the company ISSUING the invoice, not receiving it)
+- vendorTaxId: Tax ID (VAT number, GSTIN, etc.) - include the country prefix if present (e.g., "US-XXX", "DE-XXX", "NL-XXX")
 - issueDate: Invoice/issue date in YYYY-MM-DD format
 - dueDate: Payment due date in YYYY-MM-DD format (null if not present)
 - currency: 3-letter currency code (USD, EUR, INR, etc.)
@@ -31,7 +33,8 @@ Extract the following fields:
 - totalAmount: Total amount including tax
 - lineItems: Array of line items with description, quantity, unitPrice, and total
 
-Return ONLY a valid JSON object with no additional text or markdown formatting.`;
+INVOICE TEXT:
+`;
 
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
@@ -40,8 +43,18 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // Convert PDF to base64
-    const pdfBase64 = pdfBuffer.toString('base64');
+    // First extract text from PDF using pdf-parse
+    const pdfData = await pdf(pdfBuffer);
+    const pdfText = pdfData.text;
+
+    if (!pdfText || pdfText.trim().length === 0) {
+      return {
+        data: null,
+        confidence: 0,
+        rawResponse: '',
+        error: 'No text could be extracted from PDF',
+      };
+    }
 
     const message = await anthropic.messages.create({
       model: MODEL,
@@ -49,20 +62,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       messages: [
         {
           role: 'user',
-          content: [
-            {
-              type: 'document',
-              source: {
-                type: 'base64',
-                media_type: 'application/pdf',
-                data: pdfBase64,
-              },
-            },
-            {
-              type: 'text',
-              text: EXTRACTION_PROMPT,
-            },
-          ],
+          content: EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
         },
       ],
     });
