@@ -54,36 +54,97 @@ function normalizeTaxId(taxId: string): string {
   return taxId.replace(/[\s.\-]/g, '').toUpperCase();
 }
 
+// Check if there's a math error in the invoice amounts
+export function checkMathError(
+  subtotal: number | null | undefined,
+  taxAmount: number | null | undefined,
+  totalAmount: number | null | undefined
+): { hasError: boolean; message: string } {
+  // If any value is missing, we can't check math
+  if (subtotal == null || totalAmount == null) {
+    return { hasError: false, message: '' };
+  }
+
+  // Tax can be 0 or missing, default to 0
+  const tax = taxAmount || 0;
+  const calculatedTotal = subtotal + tax;
+
+  // Allow small rounding differences (0.02 tolerance)
+  const tolerance = 0.02;
+  const difference = Math.abs(calculatedTotal - totalAmount);
+
+  if (difference > tolerance) {
+    return {
+      hasError: true,
+      message: `Math error detected: Subtotal (${subtotal}) + Tax (${tax}) = ${calculatedTotal.toFixed(2)}, but Total shows ${totalAmount}`,
+    };
+  }
+
+  return { hasError: false, message: '' };
+}
+
 // Vendor validation helper
 export function validateVendor(
   vendorName: string | null | undefined,
   vendorTaxId: string | null | undefined,
-  companies: Company[]
+  companies: Company[],
+  extractedData?: {
+    subtotal?: number | null;
+    taxAmount?: number | null;
+    totalAmount?: number | null;
+  }
 ): {
-  status: 'matched' | 'mismatched' | 'unknown';
+  status: 'matched' | 'flagged';
   vendorMatched: boolean;
   taxIdMatched: boolean;
+  mathError: boolean;
   matchedCompanyId?: string;
   notes: string[];
+  confidenceAdjustment: number;
 } {
   const notes: string[] = [];
   let vendorMatched = false;
   let taxIdMatched = false;
+  let mathError = false;
   let matchedCompanyId: string | undefined;
+  let confidenceAdjustment = 0;
 
   // Handle null/undefined/empty values
   const safeVendorName = vendorName?.trim() || '';
   const safeVendorTaxId = vendorTaxId?.trim() || '';
 
-  // If no vendor name, return unknown immediately
+  // If no vendor name, return flagged immediately
   if (!safeVendorName) {
     return {
-      status: 'unknown',
+      status: 'flagged',
       vendorMatched: false,
       taxIdMatched: false,
+      mathError: false,
       matchedCompanyId: undefined,
       notes: ['Vendor name is empty or missing from invoice'],
+      confidenceAdjustment: -0.5,
     };
+  }
+
+  // Check for math error
+  if (extractedData) {
+    const mathCheck = checkMathError(
+      extractedData.subtotal,
+      extractedData.taxAmount,
+      extractedData.totalAmount
+    );
+    if (mathCheck.hasError) {
+      mathError = true;
+      notes.push(mathCheck.message);
+      confidenceAdjustment -= 0.2;
+    }
+  }
+
+  // Check if tax ID is missing from invoice
+  const taxIdMissing = !safeVendorTaxId;
+  if (taxIdMissing) {
+    notes.push('Tax ID is missing from invoice');
+    confidenceAdjustment -= 0.3;
   }
 
   // Try to find company by tax ID first (more reliable)
@@ -97,6 +158,8 @@ export function validateVendor(
       taxIdMatched = true;
       matchedCompanyId = companyByTaxId.id;
       notes.push(`Tax ID matched to company: ${companyByTaxId.name}`);
+    } else {
+      notes.push('Tax ID not found in records');
     }
   }
 
@@ -124,31 +187,29 @@ export function validateVendor(
         const normalizedInvoiceTaxId = normalizeTaxId(safeVendorTaxId);
         const normalizedCompanyTaxId = normalizeTaxId(companyByName.taxId);
         if (normalizedInvoiceTaxId !== normalizedCompanyTaxId) {
-          notes.push(`Warning: Tax ID mismatch. Invoice: ${safeVendorTaxId}, Record: ${companyByName.taxId}`);
+          notes.push(`Tax ID mismatch. Invoice: ${safeVendorTaxId}, Record: ${companyByName.taxId}`);
         }
       }
     }
+  } else {
+    notes.push('Vendor name not found in company records');
   }
 
-  // Determine status
-  let status: 'matched' | 'mismatched' | 'unknown';
-  if (vendorMatched && taxIdMatched) {
-    status = 'matched';
+  // Determine status - ONLY matched if BOTH vendor AND tax ID match AND no math error
+  const status: 'matched' | 'flagged' =
+    vendorMatched && taxIdMatched && !mathError ? 'matched' : 'flagged';
+
+  if (status === 'matched') {
     notes.push('Vendor fully validated');
-  } else if (vendorMatched || taxIdMatched) {
-    status = 'mismatched';
-    if (!vendorMatched) notes.push('Vendor name not found in records');
-    if (!taxIdMatched) notes.push('Tax ID not found in records');
-  } else {
-    status = 'unknown';
-    notes.push('Vendor not found in company records');
   }
 
   return {
     status,
     vendorMatched,
     taxIdMatched,
+    mathError,
     matchedCompanyId,
     notes,
+    confidenceAdjustment,
   };
 }

@@ -29,15 +29,18 @@ export default function DashboardPage() {
 
       // Calculate stats
       const total = data.items?.length || 0;
-      const matched = data.items?.filter((inv: ProcessedInvoice) =>
-        inv.processingNotes?.toLowerCase().includes('matched') ||
-        inv.processingNotes?.toLowerCase().includes('fully validated')
+      const matched = data.items?.filter((inv: ProcessedInvoice) => {
+        const notes = inv.processingNotes?.toLowerCase() || '';
+        // Only count as matched if "fully validated" AND no warnings/issues
+        return notes.includes('fully validated') &&
+               !notes.includes('not found') &&
+               !notes.includes('missing') &&
+               !notes.includes('mismatch') &&
+               !notes.includes('error');
+        }
       ).length || 0;
-      const flagged = data.items?.filter((inv: ProcessedInvoice) =>
-        inv.processingNotes?.toLowerCase().includes('mismatch') ||
-        inv.processingNotes?.toLowerCase().includes('warning') ||
-        inv.processingNotes?.toLowerCase().includes('unknown')
-      ).length || 0;
+      // Everything else is flagged
+      const flagged = total - matched;
 
       const totalAmount = data.items?.reduce((sum: number, inv: ProcessedInvoice) => {
         const amount = inv.extractedData?.totalAmount as number;
@@ -50,47 +53,45 @@ export default function DashboardPage() {
         flaggedIssues: flagged,
         totalAmount,
         currency: 'EUR',
-      });
+      })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load invoices');
+      setError(err instanceof Error ? err.message : 'Failed to load invoices')
     } finally {
-      setIsLoading(false);
+      setIsLoading(false)
     }
-  }, []);
+  }, [])
 
   useEffect(() => {
-    fetchInvoices();
-  }, [fetchInvoices]);
+    fetchInvoices()
+  }, [fetchInvoices])
 
   const handleProcessAll = async () => {
-    setIsProcessing(true);
-    setError(null);
+    setIsProcessing(true)
+    setError(null)
     try {
-      const response = await fetch('/api/process-all', { method: 'POST' });
+      const response = await fetch('/api/process-all', { method: 'POST' })
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Failed to process invoices');
+        const data = await response.json()
+        throw new Error(data.error || 'Failed to process invoices')
       }
-      await fetchInvoices();
+      await fetchInvoices()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Processing failed');
+      setError(err instanceof Error ? err.message : 'Processing failed')
     } finally {
-      setIsProcessing(false);
+      setIsProcessing(false)
     }
-  };
+  }
 
   const handleReset = async () => {
-    if (!confirm('Are you sure you want to delete all processed invoices?')) return;
-    setIsLoading(true);
+    if (!confirm('Are you sure you want to delete all processed invoices?')) return
+    setIsLoading(true)
     try {
-      await fetch('/api/erp/processed-invoices', { method: 'DELETE' });
-      await fetchInvoices();
+      await fetch('/api/erp/processed-invoices', { method: 'DELETE' })
+      await fetchInvoices()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Reset failed');
-    } finally {
-      setIsLoading(false);
+      setError(err instanceof Error ? err.message : 'Reset failed')
     }
-  };
+  }
 
   const formatTotalAmount = (amount: number) => {
     return new Intl.NumberFormat('en-US', {
@@ -98,8 +99,8 @@ export default function DashboardPage() {
       currency: stats.currency,
       minimumFractionDigits: 0,
       maximumFractionDigits: 0,
-    }).format(amount);
-  };
+    }).format(amount)
+  }
 
   return (
     <div className="min-h-screen bg-gray-100">
@@ -123,17 +124,7 @@ export default function DashboardPage() {
               disabled={isLoading || isProcessing}
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              {isProcessing ? (
-                <span className="flex items-center gap-2">
-                  <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                  Processing...
-                </span>
-              ) : (
-                'Process All Invoices'
-              )}
+              {isProcessing ? 'Processing...' : 'Process All Invoices'}
             </button>
           </div>
         </div>
@@ -195,5 +186,5 @@ export default function DashboardPage() {
         </div>
       </main>
     </div>
-  );
+  )
 }

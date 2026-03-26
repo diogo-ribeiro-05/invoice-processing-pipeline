@@ -29,18 +29,14 @@ function formatDate(dateStr: string): string {
   }
 }
 
-function getValidationStatus(invoice: ProcessedInvoice): 'matched' | 'mismatched' | 'unknown' {
+function getValidationStatus(invoice: ProcessedInvoice): 'matched' | 'flagged' {
   const notes = invoice.processingNotes?.toLowerCase() || '';
-  if (notes.includes('fully validated') || notes.includes('matched')) {
-    if (notes.includes('warning') || notes.includes('mismatch')) {
-      return 'mismatched';
-    }
+
+  // Only matched if BOTH vendor matched AND tax ID matched
+  if (notes.includes('fully validated') && !notes.includes('not found') && !notes.includes('mismatch') && !notes.includes('missing')) {
     return 'matched';
   }
-  if (notes.includes('not found') || notes.includes('unknown')) {
-    return 'unknown';
-  }
-  return 'unknown';
+  return 'flagged';
 }
 
 export default function InvoiceTable({

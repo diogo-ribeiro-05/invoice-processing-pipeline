@@ -50,17 +50,27 @@ export async function POST() {
 
         const extractedData = extractionResult.data;
 
-        // Validate vendor
+        // Validate vendor (pass extracted data for math validation)
         const validation = validateVendor(
           extractedData.vendorName,
           extractedData.vendorTaxId || '',
-          companies
+          companies,
+          {
+            subtotal: extractedData.subtotal,
+            taxAmount: extractedData.taxAmount,
+            totalAmount: extractedData.totalAmount,
+          }
         );
+
+        // Adjust confidence score based on validation
+        let adjustedConfidence = extractionResult.confidence + (validation.confidenceAdjustment || 0);
+        // Clamp confidence between 0 and 1
+        adjustedConfidence = Math.max(0, Math.min(1, adjustedConfidence));
 
         // Build processing notes
         const processingNotes = [
           ...validation.notes,
-          `Confidence: ${(extractionResult.confidence * 100).toFixed(0)}%`,
+          `Confidence: ${(adjustedConfidence * 100).toFixed(0)}%`,
         ].join('; ');
 
         // Submit to ERP
@@ -68,7 +78,7 @@ export async function POST() {
           await submitProcessedInvoice({
             fileName,
             extractedData: extractedData as unknown as Record<string, unknown>,
-            confidenceScore: extractionResult.confidence,
+            confidenceScore: adjustedConfidence,
             processingNotes,
           });
 
@@ -78,7 +88,7 @@ export async function POST() {
             status: 'processed',
             extractedData,
             validation,
-            confidenceScore: extractionResult.confidence,
+            confidenceScore: adjustedConfidence,
             processingNotes,
           });
         } catch (submitError) {

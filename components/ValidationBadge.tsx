@@ -9,13 +9,9 @@ const statusConfig = {
     label: 'Matched',
     className: 'bg-green-100 text-green-800 border-green-300',
   },
-  mismatched: {
-    label: 'Mismatched',
-    className: 'bg-yellow-100 text-yellow-800 border-yellow-300',
-  },
-  unknown: {
-    label: 'Unknown',
-    className: 'bg-gray-100 text-gray-800 border-gray-300',
+  flagged: {
+    label: 'Flagged Issues',
+    className: 'bg-red-100 text-red-800 border-red-300',
   },
   pending: {
     label: 'Pending',

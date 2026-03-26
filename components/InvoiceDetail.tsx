@@ -28,15 +28,67 @@ function formatDate(dateStr: string | null | undefined): string {
   }
 }
 
-function getValidationStatus(notes: string): 'matched' | 'mismatched' | 'unknown' {
+function getValidationStatus(notes: string): 'matched' | 'flagged' {
   const lowerNotes = notes?.toLowerCase() || '';
-  if (lowerNotes.includes('fully validated')) {
+  if (lowerNotes.includes('fully validated') && !lowerNotes.includes('not found') && !lowerNotes.includes('missing') && !lowerNotes.includes('mismatch')) {
     return 'matched';
   }
-  if (lowerNotes.includes('mismatch') || lowerNotes.includes('warning')) {
-    return 'mismatched';
+  return 'flagged';
+}
+
+// Parse processing notes into individual messages
+function parseProcessingNotes(notes: string): string[] {
+  if (!notes) return [];
+  // Split by semicolons, periods followed by space, or just periods at the end
+  return notes
+    .split(/[;.]/)
+    .map(n => n.trim())
+    .filter(n => n.length > 0);
+}
+
+// Determine note type for styling
+function getNoteType(note: string): 'success' | 'warning' | 'info' {
+  const lowerNote = note.toLowerCase();
+
+  // Positive/success indicators
+  if (lowerNote.includes('matched') && !lowerNote.includes('not matched') && !lowerNote.includes('mismatch')) {
+    return 'success';
   }
-  return 'unknown';
+  if (lowerNote.includes('found') && !lowerNote.includes('not found')) {
+    return 'success';
+  }
+  if (lowerNote.includes('success')) {
+    return 'success';
+  }
+  if (lowerNote.includes('fully validated')) {
+    return 'success';
+  }
+
+  // Negative/warning indicators
+  if (lowerNote.includes('not found')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('missing')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('mismatch')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('warning')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('error')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('failed')) {
+    return 'warning';
+  }
+  if (lowerNote.includes('empty')) {
+    return 'warning';
+  }
+
+  // Default to info
+  return 'info';
 }
 
 export default function InvoiceDetail({ invoice, onClose }: InvoiceDetailProps) {
@@ -44,6 +96,7 @@ export default function InvoiceDetail({ invoice, onClose }: InvoiceDetailProps) 
 
   const data = invoice.extractedData;
   const status = getValidationStatus(invoice.processingNotes || '');
+  const parsedNotes = parseProcessingNotes(invoice.processingNotes || '');
 
   return (
     <div className="fixed inset-y-0 right-0 w-full max-w-2xl overflow-y-auto border-l border-gray-200 bg-white p-6 shadow-xl">
@@ -71,7 +124,13 @@ export default function InvoiceDetail({ invoice, onClose }: InvoiceDetailProps) 
           <div className="flex items-center gap-2">
             <ValidationBadge status={status} />
             {invoice.confidenceScore !== undefined && (
-              <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-800">
+              <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                invoice.confidenceScore >= 0.8
+                  ? 'bg-green-100 text-green-800'
+                  : invoice.confidenceScore >= 0.5
+                    ? 'bg-yellow-100 text-yellow-800'
+                    : 'bg-red-100 text-red-800'
+              }`}>
                 {(invoice.confidenceScore * 100).toFixed(0)}% confidence
               </span>
             )}
@@ -80,10 +139,38 @@ export default function InvoiceDetail({ invoice, onClose }: InvoiceDetailProps) 
       </div>
 
       {/* Processing Notes */}
-      {invoice.processingNotes && (
-        <div className="mb-6 rounded-lg border border-gray-200 bg-yellow-50 p-4">
-          <h4 className="mb-2 text-sm font-medium text-yellow-800">Processing Notes</h4>
-          <p className="text-sm text-yellow-700">{invoice.processingNotes}</p>
+      {parsedNotes.length > 0 && (
+        <div className="mb-6 rounded-lg border border-gray-200 bg-gray-50 p-4">
+          <h4 className="mb-3 text-sm font-semibold text-gray-700">Processing Notes</h4>
+          <div className="flex flex-wrap gap-2">
+            {parsedNotes.map((note, index) => {
+              const noteType = getNoteType(note);
+              return (
+                <span
+                  key={index}
+                  className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-medium ${
+                    noteType === 'success'
+                      ? 'bg-green-100 text-green-800 border border-green-200'
+                      : noteType === 'warning'
+                        ? 'bg-red-100 text-red-800 border border-red-200'
+                        : 'bg-blue-100 text-blue-800 border border-blue-200'
+                  }`}
+                >
+                  {noteType === 'success' && (
+                    <svg className="mr-1.5 h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                  )}
+                  {noteType === 'warning' && (
+                    <svg className="mr-1.5 h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                      <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                    </svg>
+                  )}
+                  {note}
+                </span>
+              );
+            })}
+          </div>
         </div>
       )}
 

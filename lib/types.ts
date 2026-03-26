@@ -41,7 +41,7 @@ export interface ProcessedInvoice {
 }
 
 // Validation Status
-export type ValidationStatus = 'matched' | 'mismatched' | 'unknown';
+export type ValidationStatus = 'matched' | 'flagged';
 
 export interface ValidationResult {
   status: ValidationStatus;
