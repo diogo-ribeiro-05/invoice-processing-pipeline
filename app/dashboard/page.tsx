@@ -12,6 +12,7 @@ export default function DashboardPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [stats, setStats] = useState<DashboardStats>({
     totalInvoices: 0,
     matchedVendors: 0,
@@ -68,15 +69,40 @@ export default function DashboardPage() {
   const handleProcessAll = async () => {
     setIsProcessing(true)
     setError(null)
+    setSuccessMessage(null)
     try {
-      const response = await fetch('/api/process-all', { method: 'POST' })
+      // Use AbortController with 5 minute timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000)
+
+      const response = await fetch('/api/process-all', {
+        method: 'POST',
+        signal: controller.signal,
+      })
+      clearTimeout(timeoutId)
+
       if (!response.ok) {
         const data = await response.json()
         throw new Error(data.error || 'Failed to process invoices')
       }
+
+      const result = await response.json()
+      console.log('Processing complete:', result.summary)
+
+      // Check if all invoices were already processed
+      if (result.alreadyProcessed) {
+        setSuccessMessage(result.message)
+      } else if (result.summary?.processed > 0) {
+        setSuccessMessage(`Successfully processed ${result.summary.processed} invoice(s)`)
+      }
+
       await fetchInvoices()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Processing failed')
+      if (err instanceof Error && err.name === 'AbortError') {
+        setError('Processing timed out. Please try again.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Processing failed')
+      }
     } finally {
       setIsProcessing(false)
     }
@@ -85,6 +111,7 @@ export default function DashboardPage() {
   const handleReset = async () => {
     if (!confirm('Are you sure you want to delete all processed invoices?')) return
     setIsLoading(true)
+    setSuccessMessage(null)
     try {
       await fetch('/api/erp/processed-invoices', { method: 'DELETE' })
       await fetchInvoices()
@@ -124,7 +151,7 @@ export default function DashboardPage() {
               disabled={isLoading || isProcessing}
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              {isProcessing ? 'Processing...' : 'Process All Invoices'}
+              {isProcessing ? 'Processing (this may take 1-2 min)...' : 'Process All Invoices'}
             </button>
           </div>
         </div>
@@ -136,6 +163,19 @@ export default function DashboardPage() {
         {error && (
           <div className="mb-6 rounded-lg border border-red-200 bg-red-50 p-4">
             <p className="text-sm text-red-700">{error}</p>
+          </div>
+        )}
+
+        {/* Success Alert */}
+        {successMessage && (
+          <div className="mb-6 rounded-lg border border-green-200 bg-green-50 p-4 flex items-center justify-between">
+            <p className="text-sm text-green-700">{successMessage}</p>
+            <button
+              onClick={() => setSuccessMessage(null)}
+              className="text-green-700 hover:text-green-900"
+            >
+              ×
+            </button>
           </div>
         )}
 
