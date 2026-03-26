@@ -3,32 +3,22 @@ import fs from 'fs';
 import path from 'path';
 import { extractInvoiceDataWithRetry } from '@/lib/claude';
 import { getCompanies, validateVendor, submitProcessedInvoice, getProcessedInvoices } from '@/lib/erp-api';
-import type { InvoiceWithStatus } from '@/lib/types';
 
-// Process with concurrency limit to avoid overwhelming the API
-async function processWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  processor: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results: R[] = [];
-  let index = 0;
+export const dynamic = 'force-dynamic';
 
-  async function processNext(): Promise<void> {
-    while (index < items.length) {
-      const currentIndex = index++;
-      const result = await processor(items[currentIndex]);
-      results[currentIndex] = result;
-    }
-  }
-
-  // Start concurrent workers
-  const workers = Array(Math.min(concurrency, items.length))
-    .fill(null)
-    .map(() => processNext());
-
-  await Promise.all(workers);
-  return results;
+interface ProgressUpdate {
+  type: 'progress' | 'complete' | 'error';
+  current: number;
+  total: number;
+  fileName?: string;
+  status?: 'processing' | 'processed' | 'skipped' | 'error';
+  message?: string;
+  summary?: {
+    total: number;
+    processed: number;
+    skipped: number;
+    errors: number;
+  };
 }
 
 export async function POST() {
@@ -36,26 +26,20 @@ export async function POST() {
     const invoicesDir = path.join(process.cwd(), 'invoices');
 
     if (!fs.existsSync(invoicesDir)) {
-      return NextResponse.json(
-        { error: 'Invoices directory not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Invoices directory not found' }, { status: 404 });
     }
 
     const files = fs.readdirSync(invoicesDir).filter((f) => f.endsWith('.pdf'));
 
     if (files.length === 0) {
-      return NextResponse.json(
-        { error: 'No PDF files found in invoices directory' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'No PDF files found' }, { status: 400 });
     }
 
-    // Get already processed invoices to avoid duplicates
+    // Get already processed invoices
     const existingInvoices = await getProcessedInvoices();
     const existingFileNames = new Set(existingInvoices.items.map((inv) => inv.fileName));
 
-    // Check if all files are already processed
+    // Check if all already processed
     const filesToProcess = files.filter((f) => !existingFileNames.has(f));
     const skippedCount = files.length - filesToProcess.length;
 
@@ -64,135 +48,160 @@ export async function POST() {
         success: true,
         alreadyProcessed: true,
         message: 'All invoices have already been processed. Click Reset to process again.',
-        summary: {
-          total: files.length,
-          processed: 0,
-          skipped: skippedCount,
-          errors: 0,
-        },
-        results: files.map((fileName) => ({
-          id: fileName,
-          fileName,
-          status: 'skipped',
-          message: 'Already processed',
-        })),
+        summary: { total: files.length, processed: 0, skipped: skippedCount, errors: 0 },
       });
     }
 
     // Get companies for validation
     const companies = await getCompanies();
 
-    // Process files in parallel with concurrency of 3
-    const processFile = async (fileName: string): Promise<InvoiceWithStatus> => {
-      try {
-        const filePath = path.join(invoicesDir, fileName);
-        const pdfBuffer = fs.readFileSync(filePath);
+    // Create a streaming response
+    const encoder = new TextEncoder();
+    let current = 0;
+    let processed = 0;
+    let errors = 0;
 
-        const extractionResult = await extractInvoiceDataWithRetry(pdfBuffer);
+    const stream = new ReadableStream({
+      async start(controller) {
+        const sendProgress = (update: ProgressUpdate) => {
+          const data = `data: ${JSON.stringify(update)}\n\n`;
+          controller.enqueue(encoder.encode(data));
+        };
 
-        if (!extractionResult.data) {
-          return {
-            id: fileName,
+        // Send initial status
+        sendProgress({
+          type: 'progress',
+          current: 0,
+          total: files.length,
+          message: `Found ${filesToProcess.length} invoices to process...`,
+        });
+
+        // Process files in parallel with concurrency limit
+        const concurrency = 3;
+        let index = 0;
+
+        const processFile = async (fileName: string): Promise<void> => {
+          current++;
+          sendProgress({
+            type: 'progress',
+            current,
+            total: files.length,
             fileName,
-            status: 'error',
-            error: extractionResult.error || 'Extraction failed',
-          };
-        }
-
-        const extractedData = extractionResult.data;
-
-        // Validate vendor (pass extracted data for math validation)
-        const validation = validateVendor(
-          extractedData.vendorName,
-          extractedData.vendorTaxId || '',
-          companies,
-          {
-            subtotal: extractedData.subtotal,
-            taxAmount: extractedData.taxAmount,
-            totalAmount: extractedData.totalAmount,
-          }
-        );
-
-        // Adjust confidence score based on validation
-        let adjustedConfidence = extractionResult.confidence + (validation.confidenceAdjustment || 0);
-        adjustedConfidence = Math.max(0, Math.min(1, adjustedConfidence));
-
-        // Build processing notes
-        const processingNotes = [
-          ...validation.notes,
-          `Confidence: ${(adjustedConfidence * 100).toFixed(0)}%`,
-        ].join('; ');
-
-        // Submit to ERP
-        try {
-          await submitProcessedInvoice({
-            fileName,
-            extractedData,
-            confidenceScore: adjustedConfidence,
-            processingNotes,
+            status: 'processing',
+            message: `Processing ${fileName}...`,
           });
 
-          return {
-            id: fileName,
-            fileName,
-            status: 'processed',
-            extractedData,
-            validation,
-          };
-        } catch (submitError) {
-          return {
-            id: fileName,
-            fileName,
-            status: 'error',
-            extractedData,
-            validation,
-            error: `Submit failed: ${submitError instanceof Error ? submitError.message : 'Unknown'}`,
-          };
-        }
-      } catch (error) {
-        return {
-          id: fileName,
-          fileName,
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Unknown error',
+          try {
+            const filePath = path.join(invoicesDir, fileName);
+            const pdfBuffer = fs.readFileSync(filePath);
+            const extractionResult = await extractInvoiceDataWithRetry(pdfBuffer);
+
+            if (!extractionResult.data) {
+              errors++;
+              sendProgress({
+                type: 'progress',
+                current,
+                total: files.length,
+                fileName,
+                status: 'error',
+                message: `Failed to extract data from ${fileName}`,
+              });
+              return;
+            }
+
+            const extractedData = extractionResult.data;
+            const validation = validateVendor(
+              extractedData.vendorName,
+              extractedData.vendorTaxId || '',
+              companies,
+              {
+                subtotal: extractedData.subtotal,
+                taxAmount: extractedData.taxAmount,
+                totalAmount: extractedData.totalAmount,
+              }
+            );
+
+            let adjustedConfidence = extractionResult.confidence + (validation.confidenceAdjustment || 0);
+            adjustedConfidence = Math.max(0, Math.min(1, adjustedConfidence));
+
+            const processingNotes = [
+              ...validation.notes,
+              `Confidence: ${(adjustedConfidence * 100).toFixed(0)}%`,
+            ].join('; ');
+
+            await submitProcessedInvoice({
+              fileName,
+              extractedData,
+              confidenceScore: adjustedConfidence,
+              processingNotes,
+            });
+
+            processed++;
+            sendProgress({
+              type: 'progress',
+              current,
+              total: files.length,
+              fileName,
+              status: 'processed',
+              message: `Processed ${fileName}`,
+            });
+          } catch (error) {
+            errors++;
+            sendProgress({
+              type: 'progress',
+              current,
+              total: files.length,
+              fileName,
+              status: 'error',
+              message: `Error processing ${fileName}: ${error instanceof Error ? error.message : 'Unknown'}`,
+            });
+          }
         };
-      }
-    };
 
-    // Process in parallel with concurrency limit of 3
-    const processedResults = await processWithConcurrency(filesToProcess, 3, processFile);
+        // Process with concurrency
+        const processNext = async (): Promise<void> => {
+          while (index < filesToProcess.length) {
+            const currentIndex = index++;
+            await processFile(filesToProcess[currentIndex]);
+          }
+        };
 
-    // Combine skipped and processed results
-    const skippedResults: InvoiceWithStatus[] = files
-      .filter((f) => existingFileNames.has(f))
-      .map((fileName) => ({
-        id: fileName,
-        fileName,
-        status: 'skipped' as const,
-        message: 'Already processed',
-      }));
+        // Start concurrent workers
+        const workers = Array(Math.min(concurrency, filesToProcess.length))
+          .fill(null)
+          .map(() => processNext());
 
-    const allResults = [...skippedResults, ...processedResults];
+        await Promise.all(workers);
 
-    const summary = {
-      total: files.length,
-      processed: processedResults.filter((r) => r.status === 'processed').length,
-      skipped: skippedCount,
-      errors: processedResults.filter((r) => r.status === 'error').length,
-    };
+        // Send completion
+        sendProgress({
+          type: 'complete',
+          current: files.length,
+          total: files.length,
+          summary: {
+            total: files.length,
+            processed,
+            skipped: skippedCount,
+            errors,
+          },
+          message: `Completed! ${processed} processed, ${skippedCount} skipped, ${errors} errors.`,
+        });
 
-    return NextResponse.json({
-      success: true,
-      summary,
-      results: allResults,
+        controller.close();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
     });
   } catch (error) {
     console.error('Batch process error:', error);
     return NextResponse.json(
-      {
-        error: 'Failed to process invoices',
-        details: error instanceof Error ? error.message : 'Unknown error',
-      },
+      { error: 'Failed to process invoices', details: error instanceof Error ? error.message : 'Unknown' },
       { status: 500 }
     );
   }

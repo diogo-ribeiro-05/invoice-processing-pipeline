@@ -6,6 +6,14 @@ import StatsCard from '@/components/StatsCard';
 import InvoiceTable from '@/components/InvoiceTable';
 import InvoiceDetail from '@/components/InvoiceDetail';
 
+interface ProgressState {
+  current: number;
+  total: number;
+  fileName: string;
+  status: string;
+  message: string;
+}
+
 export default function DashboardPage() {
   const [invoices, setInvoices] = useState<ProcessedInvoice[]>([]);
   const [selectedInvoice, setSelectedInvoice] = useState<ProcessedInvoice | null>(null);
@@ -13,6 +21,7 @@ export default function DashboardPage() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ProgressState | null>(null);
   const [stats, setStats] = useState<DashboardStats>({
     totalInvoices: 0,
     matchedVendors: 0,
@@ -70,41 +79,83 @@ export default function DashboardPage() {
     setIsProcessing(true)
     setError(null)
     setSuccessMessage(null)
-    try {
-      // Use AbortController with 5 minute timeout
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000)
+    setProgress({ current: 0, total: 0, fileName: '', status: '', message: 'Starting...' })
 
-      const response = await fetch('/api/process-all', {
-        method: 'POST',
-        signal: controller.signal,
-      })
-      clearTimeout(timeoutId)
+    try {
+      const response = await fetch('/api/process-all', { method: 'POST' })
 
       if (!response.ok) {
         const data = await response.json()
         throw new Error(data.error || 'Failed to process invoices')
       }
 
-      const result = await response.json()
-      console.log('Processing complete:', result.summary)
+      // Read the streaming response
+      const reader = response.body?.getReader()
+      const decoder = new TextDecoder()
 
-      // Check if all invoices were already processed
-      if (result.alreadyProcessed) {
-        setSuccessMessage(result.message)
-      } else if (result.summary?.processed > 0) {
-        setSuccessMessage(`Successfully processed ${result.summary.processed} invoice(s)`)
+      if (!reader) {
+        throw new Error('No response body')
+      }
+
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+
+        // Process complete messages (each line is a JSON object)
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || '' // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const jsonStr = line.slice(6) // Remove 'data: ' prefix
+              const update = JSON.parse(jsonStr)
+
+              if (update.type === 'progress') {
+                setProgress({
+                  current: update.current,
+                  total: update.total,
+                  fileName: update.fileName || '',
+                  status: update.status || '',
+                  message: update.message || '',
+                })
+              } else if (update.type === 'complete') {
+                setProgress({
+                  current: update.current,
+                  total: update.total,
+                  fileName: '',
+                  status: 'complete',
+                  message: update.message || 'Processing complete!',
+                })
+
+                if (update.summary) {
+                  const { processed, skipped, errors } = update.summary
+                  if (processed > 0) {
+                    setSuccessMessage(`Successfully processed ${processed} invoice(s)`)
+                  } else if (skipped > 0 && processed === 0) {
+                    setSuccessMessage('All invoices were already processed. Click Reset to process again.')
+                  }
+                }
+              } else if (update.type === 'error') {
+                setError(update.message || 'Processing failed')
+              }
+            } catch (e) {
+              console.error('Failed to parse progress update:', line, e)
+            }
+          }
+        }
       }
 
       await fetchInvoices()
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        setError('Processing timed out. Please try again.')
-      } else {
-        setError(err instanceof Error ? err.message : 'Processing failed')
-      }
+      setError(err instanceof Error ? err.message : 'Processing failed')
     } finally {
       setIsProcessing(false)
+      setTimeout(() => setProgress(null), 2000) // Hide progress after 2s
     }
   }
 
@@ -112,6 +163,7 @@ export default function DashboardPage() {
     if (!confirm('Are you sure you want to delete all processed invoices?')) return
     setIsLoading(true)
     setSuccessMessage(null)
+    setProgress(null)
     try {
       await fetch('/api/erp/processed-invoices', { method: 'DELETE' })
       await fetchInvoices()
@@ -128,6 +180,8 @@ export default function DashboardPage() {
       maximumFractionDigits: 0,
     }).format(amount)
   }
+
+  const progressPercent = progress ? Math.round((progress.current / progress.total) * 100) : 0
 
   return (
     <div className="min-h-screen bg-gray-100">
@@ -151,7 +205,7 @@ export default function DashboardPage() {
               disabled={isLoading || isProcessing}
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              {isProcessing ? 'Processing (this may take 1-2 min)...' : 'Process All Invoices'}
+              {isProcessing ? 'Processing...' : 'Process All Invoices'}
             </button>
           </div>
         </div>
@@ -176,6 +230,31 @@ export default function DashboardPage() {
             >
               ×
             </button>
+          </div>
+        )}
+
+        {/* Progress Bar */}
+        {progress && (
+          <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-sm font-medium text-blue-700">
+                {progress.message}
+              </span>
+              <span className="text-sm text-blue-600">
+                {progress.current} / {progress.total} ({progressPercent}%)
+              </span>
+            </div>
+            <div className="h-3 w-full overflow-hidden rounded-full bg-blue-200">
+              <div
+                className="h-full rounded-full bg-blue-600 transition-all duration-300 ease-out"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+            {progress.fileName && (
+              <p className="mt-2 text-xs text-blue-600">
+                {progress.status === 'processing' ? '⏳' : progress.status === 'processed' ? '✅' : progress.status === 'error' ? '❌' : '⏭️'} {progress.fileName}
+              </p>
+            )}
           </div>
         )}
 
