@@ -96,62 +96,72 @@ export default function DashboardPage() {
         throw new Error(data.error || 'Failed to process invoices')
       }
 
-      // Read the streaming response
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder()
+      // Check if response is JSON (already processed) or streaming
+      const contentType = response.headers.get('content-type') || ''
 
-      if (!reader) {
-        throw new Error('No response body')
-      }
+      if (contentType.includes('application/json')) {
+        // All invoices already processed - show message directly
+        setProgress(null)
+        const data = await response.json()
+        if (data.alreadyProcessed) {
+          setSuccessMessage('All invoices were already processed. Click Reset to process again.')
+        }
+      } else {
+        // Streaming response - read the stream
+        const reader = response.body?.getReader()
+        const decoder = new TextDecoder()
 
-      let buffer = ''
+        if (!reader) {
+          throw new Error('No response body')
+        }
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+        let buffer = ''
 
-        buffer += decoder.decode(value, { stream: true })
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
 
-        // Process complete messages (each line is a JSON object)
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || '' // Keep incomplete line in buffer
+          buffer += decoder.decode(value, { stream: true })
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const jsonStr = line.slice(6) // Remove 'data: ' prefix
-              const update = JSON.parse(jsonStr)
+          // Process complete messages (each line is a JSON object)
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || '' // Keep incomplete line in buffer
 
-              if (update.type === 'progress') {
-                setProgress({
-                  current: update.current,
-                  total: update.total,
-                  fileName: update.fileName || '',
-                  status: update.status || '',
-                  message: update.message || '',
-                })
-              } else if (update.type === 'complete') {
-                setProgress({
-                  current: update.current,
-                  total: update.total,
-                  fileName: '',
-                  status: 'complete',
-                  message: update.message || 'Processing complete!',
-                })
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const jsonStr = line.slice(6) // Remove 'data: ' prefix
+                const update = JSON.parse(jsonStr)
 
-                if (update.summary) {
-                  const { processed, skipped, errors } = update.summary
-                  if (processed > 0) {
-                    setSuccessMessage(`Successfully processed ${processed} invoice(s)`)
-                  } else if (skipped > 0 && processed === 0) {
-                    setSuccessMessage('All invoices were already processed. Click Reset to process again.')
+                if (update.type === 'progress') {
+                  setProgress({
+                    current: update.current,
+                    total: update.total,
+                    fileName: update.fileName || '',
+                    status: update.status || '',
+                    message: update.message || '',
+                  })
+                } else if (update.type === 'complete') {
+                  setProgress({
+                    current: update.current,
+                    total: update.total,
+                    fileName: '',
+                    status: 'complete',
+                    message: update.message || 'Processing complete!',
+                  })
+
+                  if (update.summary) {
+                    const { processed } = update.summary
+                    if (processed > 0) {
+                      setSuccessMessage(`Successfully processed ${processed} invoice(s)`)
+                    }
                   }
+                } else if (update.type === 'error') {
+                  setError(update.message || 'Processing failed')
                 }
-              } else if (update.type === 'error') {
-                setError(update.message || 'Processing failed')
+              } catch (e) {
+                console.error('Failed to parse progress update:', line, e)
               }
-            } catch (e) {
-              console.error('Failed to parse progress update:', line, e)
             }
           }
         }
