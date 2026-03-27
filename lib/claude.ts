@@ -20,6 +20,8 @@ STRICT RULES FOR VENDOR NAME:
 2. NO REFERENCE CODES: Do not extract alphanumeric order IDs, customer numbers, or document IDs as the Vendor Name. Real company names usually contain natural words and often end with legal entity suffixes (Inc., B.V., Ltd., LLC, Corp., AG, etc.).
 3. TABULAR DATA: Never extract the vendor name from data inside tables under columns like "Customer", "Klant", "Order", or "Client".
 4. CONTEXTUAL CLUES: Watch for international proxy terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the actual vendor entity.
+5. SHIPPING/CONTACT PERSONS: Names located under "Bill To", "Ship To", "Factuuradres", "Afleveradres", or "Klant" are ALWAYS the CUSTOMER or CONTACT PERSON. NEVER extract them as the Vendor.
+6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company") or lowercase individual contact names - these are NOT the vendor.
 
 === TAX ID EXTRACTION ===
 Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW-nr"
@@ -34,10 +36,18 @@ Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number"
 - Verify: subtotal + tax ≈ total.
 - Do not include digits from product codes or row numbers.
 
+=== INVOICE NUMBER ===
+- Extract the EXACT full string including any letter prefixes, dashes, or slashes.
+- Do NOT strip letters from the invoice number (e.g., "INV-2024-001" stays as-is, not "2024001").
+
+=== LINE ITEMS ===
+- Extract ALL rows from the items table, including those with a 0.00 price or discount lines.
+- Do not skip any items regardless of their value.
+
 === REQUIRED JSON OUTPUT ===
 Return ONLY a JSON object with these exact field names:
 {
-  "invoiceNumber": "string",
+  "invoiceNumber": "string (exact value, do not strip prefixes)",
   "vendorName": "string",
   "vendorTaxId": "string or null",
   "issueDate": "YYYY-MM-DD",
@@ -293,16 +303,15 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       console.log('Text extraction insufficient, trying OCR fallback...');
       const ocrResult = await extractWithOcr(pdfBuffer);
 
-      // Use OCR result if it provides more complete data
-      if (ocrResult.vendorName && !extractedData.vendorName) {
+      // OCR regex finds strict legal entity matches, so prefer OCR results over LLM guesses
+      // The LLM often extracts contact persons or placeholder names incorrectly
+      if (ocrResult.vendorName) {
         extractedData.vendorName = ocrResult.vendorName;
         console.log('OCR provided better vendor name:', ocrResult.vendorName);
       }
-      if (ocrResult.vendorTaxId && !extractedData.vendorTaxId) {
+      if (ocrResult.vendorTaxId) {
         extractedData.vendorTaxId = ocrResult.vendorTaxId;
         console.log('OCR found vendor tax ID:', ocrResult.vendorTaxId);
-      } else {
-        console.log('OCR did not improve data, keeping text extraction result');
       }
     }
 
