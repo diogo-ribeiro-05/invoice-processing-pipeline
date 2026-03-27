@@ -167,7 +167,7 @@ function extractVendorNameFromOcrText(ocrText: string): string | null {
     // Look for issuer indicators
     if (lowerLine.includes('e-luscious') || lowerLine.includes('saeco')) {
       // Extract company name with suffix
-      const match = line.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.)/i);
+      const match = line.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.))/i);
       if (match) {
         return match[1].trim();
       }
@@ -175,7 +175,7 @@ function extractVendorNameFromOcrText(ocrText: string): string | null {
   }
 
   // Fallback: look for any B.V. company
-  const bvMatch = ocrText.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG)/);
+  const bvMatch = ocrText.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG))/);
   if (bvMatch) {
     return bvMatch[1].trim();
   }
