@@ -9,28 +9,25 @@ const anthropic = new Anthropic({
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
+/**
+ * Main extraction prompt for digital text (Pass 1)
+ * Extracts all invoice fields from digital PDF text
+ */
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
-
-=== INPUT FORMAT ===
-You are provided with both DIGITAL TEXT and OCR TEXT. Cross-reference them to build the final JSON:
-- VENDOR NAMES and TAX IDs are often found in the OCR TEXT (extracted from image logos at the header or footers).
-- TABULAR DATA, line items, and exact amounts are usually more accurate in the DIGITAL TEXT.
-- PRIORITIZE OCR TEXT for company identity if it looks like a valid legal entity (with suffixes like B.V., Inc., GmbH, etc.).
 
 === CRITICAL: VENDOR NAME EXTRACTION ===
 The VENDOR is the company ISSUING the invoice (the seller/biller).
 The CUSTOMER is the company RECEIVING the invoice (the buyer).
 
 STRICT RULES FOR VENDOR NAME:
-1. POSITIONING: The Vendor name is typically the FIRST entity mentioned at the absolute top of the document (header). The Customer is usually listed further down, often under labels like "Bill To", "Factuuradres", "Sold To", or simply below the vendor's address. Do NOT extract the Customer as the Vendor.
+1. POSITIONING: The very first text at the top of the document is often the brand's logo text. Do NOT ignore short brand names (e.g., a single word) if they appear at the very top before any addresses. The Customer is usually listed further down, under labels like "Bill To", "Factuuradres", "Sold To", or simply below the vendor's address.
 2. NO REFERENCE CODES: Do not extract alphanumeric order IDs, customer numbers, or document IDs as the Vendor Name. Real company names usually contain natural words and often end with legal entity suffixes (Inc., B.V., Ltd., LLC, Corp., AG, etc.).
 3. TABULAR DATA: Never extract the vendor name from data inside tables under columns like "Customer", "Klant", "Order", or "Client".
-4. CONTEXTUAL CLUES: Watch for international proxy terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the actual vendor entity.
+4. PROXY BILLING: If you see a legal entity acting on behalf of a brand (e.g., indicated by "iov", "i.o.v.", "in opdracht van", or "on behalf of"), the VENDOR NAME should be the MAIN BRAND being represented, not the proxy legal entity. Look for the main brand name at the absolute top of the document.
 5. SHIPPING/CONTACT PERSONS: Names located under "Bill To", "Ship To", "Factuuradres", "Afleveradres", or "Klant" are ALWAYS the CUSTOMER or CONTACT PERSON. NEVER extract them as the Vendor.
-6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company") or lowercase individual contact names - these are NOT the vendor.
+6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company", "Strategic Corp", "bosd") or lowercase individual contact names - these are NOT the vendor.
 7. TAGLINES & SLOGANS: Do not extract generic industry descriptions, taglines, or slogans (e.g., "Global Wholesaler", "Premium Services", "Logistics") as the Vendor Name. Look for the actual brand name.
-8. STRICT CUSTOMER AVOIDANCE: Any entity located directly AFTER the word "Factuuradres" (Invoice Address) or directly BEFORE the word "T.a.v." (Ter attentie van) is the CUSTOMER. NEVER extract it. The vendor will be somewhere else (often at the very top or in the OCR TEXT footer).
-9. OCR PRIORITY: If you find a brand name in the OCR TEXT (usually at the very top) and a different name in the DIGITAL TEXT recipient block, ALWAYS trust the OCR TEXT brand name as the Vendor.
+8. STRICT CUSTOMER AVOIDANCE: Any entity located directly AFTER the word "Factuuradres" (Invoice Address) or directly BEFORE the word "T.a.v." (Ter attentie van) is the CUSTOMER. NEVER extract it. The vendor will be somewhere else (often at the very top).
 
 === TAX ID EXTRACTION ===
 Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW-nr"
@@ -72,6 +69,33 @@ INVOICE TEXT:
 `;
 
 /**
+ * Targeted prompt for OCR patch extraction (Pass 2)
+ * Extracts ONLY vendorName and vendorTaxId from OCR text
+ */
+const OCR_PATCH_PROMPT = `You are extracting vendor information from OCR text scanned from an invoice image.
+
+TASK: Extract ONLY the vendor name and vendor tax ID. Ignore everything else.
+
+RULES FOR VENDOR NAME:
+1. The vendor is at the TOP of the document (often a logo/brand name).
+2. Short brand names are valid (e.g., a single word at the top).
+3. PROXY BILLING: If you see "iov", "i.o.v.", "in opdracht van", or "on behalf of", extract the MAIN BRAND being represented, not the proxy legal entity.
+4. Do NOT extract anything under "Factuuradres", "Bill To", "Ship To", "Klant", or "T.a.v." - those are customers.
+5. Ignore generic placeholders like "YourCompany" or taglines like "Global Wholesaler".
+
+RULES FOR TAX ID:
+1. Look for: "VAT", "BTW", "BTW-nr", "VAT Number", "Tax ID".
+2. Include country prefixes (e.g., NL, DE, FR).
+3. Do NOT extract "Uw BTW nummer" or "Your VAT" - those are customer Tax IDs.
+4. Return null if not found.
+
+RETURN ONLY this JSON (no markdown, no explanation):
+{"vendorName": "string", "vendorTaxId": "string or null"}
+
+OCR TEXT:
+`;
+
+/**
  * Parse JSON from Claude response, handling markdown code blocks
  */
 function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
@@ -93,6 +117,31 @@ function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
 }
 
 /**
+ * Parse the targeted OCR patch response (vendorName + vendorTaxId only)
+ */
+function parseOcrPatchResponse(rawResponse: string): { vendorName: string | null; vendorTaxId: string | null } | null {
+  try {
+    let jsonStr = rawResponse.trim();
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.slice(7);
+    } else if (jsonStr.startsWith('```')) {
+      jsonStr = jsonStr.slice(3);
+    }
+    if (jsonStr.endsWith('```')) {
+      jsonStr = jsonStr.slice(0, -3);
+    }
+    jsonStr = jsonStr.trim();
+    const parsed = JSON.parse(jsonStr);
+    return {
+      vendorName: parsed.vendorName || null,
+      vendorTaxId: parsed.vendorTaxId || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Calculate confidence based on required fields
  */
 function calculateConfidence(data: ExtractedData | null): number {
@@ -108,15 +157,44 @@ function calculateConfidence(data: ExtractedData | null): number {
 }
 
 /**
+ * Check if digital extraction needs OCR patching
+ * Returns true if vendorName is missing/placeholder or vendorTaxId is missing
+ */
+function needsOcrPatch(data: ExtractedData | null): boolean {
+  if (!data) return true;
+
+  // Check if vendor name is missing or looks like a placeholder
+  const vendorName = data.vendorName?.toLowerCase().trim() || '';
+  const placeholderPatterns = [
+    'your',
+    'yourcompany',
+    'strategic corp',
+    'bosd',
+    'unknown',
+    'n/a',
+    'placeholder',
+  ];
+
+  const isPlaceholder = !vendorName ||
+                        vendorName.length < 2 ||
+                        placeholderPatterns.some(p => vendorName.includes(p));
+
+  // Check if tax ID is missing
+  const missingTaxId = !data.vendorTaxId || data.vendorTaxId.trim() === '';
+
+  return isPlaceholder || missingTaxId;
+}
+
+/**
  * Extract text from PDF using OCR.space API
- * Uses modern Node.js Blob for true binary file upload (much safer than base64)
+ * Uses modern Node.js Blob for true binary file upload
  * Returns empty string on failure to prevent pipeline crashes
  */
 async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
   try {
     console.log('Starting OCR.space extraction...');
 
-    // Use modern Node.js Blob for true binary file upload (much safer than base64)
+    // Use modern Node.js Blob for true binary file upload
     // Convert Buffer to Uint8Array for Blob compatibility
     const uint8Array = new Uint8Array(pdfBuffer);
     const blob = new Blob([uint8Array], { type: 'application/pdf' });
@@ -160,8 +238,48 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
 }
 
 /**
- * Extract invoice data from PDF using concurrent text extraction + OCR
- * Runs pdf-parse and OCR.space in parallel, then merges results for LLM processing
+ * Extract vendor info from OCR text using targeted prompt
+ * Returns only vendorName and vendorTaxId
+ */
+async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName: string | null; vendorTaxId: string | null } | null> {
+  try {
+    console.log('Extracting vendor patch from OCR text...');
+
+    const message = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 256,
+      messages: [
+        {
+          role: 'user',
+          content: OCR_PATCH_PROMPT + '\n\n' + ocrText,
+        },
+      ],
+    });
+
+    const textBlock = message.content.find((block) => block.type === 'text');
+    if (!textBlock || textBlock.type !== 'text') {
+      console.error('No text response from OCR patch extraction');
+      return null;
+    }
+
+    const patch = parseOcrPatchResponse(textBlock.text);
+    if (patch) {
+      console.log('OCR patch extracted:', patch);
+    }
+    return patch;
+  } catch (error) {
+    console.error('OCR patch extraction error:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract invoice data using Targeted Field Patching architecture
+ *
+ * PASS 1: Full digital extraction (pdf-parse → GLM-5)
+ * VALIDATION: Check if vendorName/vendorTaxId need patching
+ * PASS 2: If needed, OCR → GLM-5 (vendor only) → patch original JSON
+ * RETURN: Merged result with perfect financial data + patched vendor info
  */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
@@ -170,14 +288,12 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // Step 1: Run digital text extraction and OCR concurrently
-    console.log('Starting concurrent extraction (pdf-parse + OCR.space)...');
+    // ========================================
+    // PASS 1: Full Digital Extraction
+    // ========================================
+    console.log('PASS 1: Starting digital text extraction...');
 
-    const [pdfData, ocrText] = await Promise.all([
-      pdf(pdfBuffer),
-      extractWithOcrSpace(pdfBuffer),
-    ]);
-
+    const pdfData = await pdf(pdfBuffer);
     const pdfText = pdfData.text;
 
     if (!pdfText || pdfText.trim().length === 0) {
@@ -189,25 +305,20 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       };
     }
 
-    // Step 2: Merge results into combined text for LLM
-    const combinedText = "--- DIGITAL TEXT ---\n" + pdfText +
-                         "\n\n--- OCR TEXT ---\n" + ocrText;
+    console.log('Digital text length:', pdfText.length);
 
-    console.log('Combined text length:', combinedText.length);
-
-    // Step 3: Process with LLM
+    // Send digital text to GLM-5 with full extraction prompt
     const message = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 4096,
       messages: [
         {
           role: 'user',
-          content: EXTRACTION_PROMPT + '\n\n' + combinedText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
+          content: EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
         },
       ],
     });
 
-    // Extract text from response
     const textBlock = message.content.find((block) => block.type === 'text');
     if (!textBlock || textBlock.type !== 'text') {
       return {
@@ -219,7 +330,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     }
 
     const rawResponse = textBlock.text;
-    const extractedData = parseJsonFromResponse(rawResponse);
+    let extractedData = parseJsonFromResponse(rawResponse);
 
     if (!extractedData) {
       return {
@@ -230,13 +341,60 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       };
     }
 
+    console.log('PASS 1 complete. Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
+
+    // ========================================
+    // VALIDATION: Check if OCR patch needed
+    // ========================================
+    if (!needsOcrPatch(extractedData)) {
+      console.log('Digital extraction complete - no OCR patch needed');
+      return {
+        data: extractedData,
+        confidence: calculateConfidence(extractedData),
+        rawResponse,
+      };
+    }
+
+    // ========================================
+    // PASS 2: Targeted OCR Patch
+    // ========================================
+    console.log('PASS 2: OCR patch needed - extracting from images...');
+
+    const ocrText = await extractWithOcrSpace(pdfBuffer);
+
+    if (!ocrText || ocrText.trim().length === 0) {
+      console.log('OCR extraction failed or empty - keeping digital result');
+      return {
+        data: extractedData,
+        confidence: calculateConfidence(extractedData),
+        rawResponse,
+      };
+    }
+
+    // Extract ONLY vendorName and vendorTaxId from OCR text
+    const vendorPatch = await extractVendorPatchFromOcr(ocrText);
+
+    if (vendorPatch) {
+      // Patch the original digital data with OCR vendor info
+      if (vendorPatch.vendorName) {
+        console.log('Patching vendorName:', extractedData.vendorName, '→', vendorPatch.vendorName);
+        extractedData.vendorName = vendorPatch.vendorName;
+      }
+      if (vendorPatch.vendorTaxId) {
+        console.log('Patching vendorTaxId:', extractedData.vendorTaxId, '→', vendorPatch.vendorTaxId);
+        extractedData.vendorTaxId = vendorPatch.vendorTaxId;
+      }
+    }
+
+    console.log('PASS 2 complete. Final Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
+
     return {
       data: extractedData,
       confidence: calculateConfidence(extractedData),
       rawResponse,
     };
   } catch (error) {
-    console.error('Claude extraction error:', error);
+    console.error('Extraction error:', error);
     return {
       data: null,
       confidence: 0,
