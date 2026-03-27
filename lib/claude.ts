@@ -28,6 +28,9 @@ STRICT RULES FOR VENDOR NAME:
 4. CONTEXTUAL CLUES: Watch for international proxy terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the actual vendor entity.
 5. SHIPPING/CONTACT PERSONS: Names located under "Bill To", "Ship To", "Factuuradres", "Afleveradres", or "Klant" are ALWAYS the CUSTOMER or CONTACT PERSON. NEVER extract them as the Vendor.
 6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company") or lowercase individual contact names - these are NOT the vendor.
+7. TAGLINES & SLOGANS: Do not extract generic industry descriptions, taglines, or slogans (e.g., "Global Wholesaler", "Premium Services", "Logistics") as the Vendor Name. Look for the actual brand name.
+8. STRICT CUSTOMER AVOIDANCE: Any entity located below the vendor address or directly next to "T.a.v.", "Attn", or "Factuuradres" is the recipient. NEVER extract it, even if it has legal suffixes like "Corp" or "Inc".
+9. OCR PRIORITY: If you find a brand name in the OCR TEXT (usually at the very top) and a different name in the DIGITAL TEXT recipient block, ALWAYS trust the OCR TEXT brand name as the Vendor.
 
 === TAX ID EXTRACTION ===
 Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW-nr"
@@ -106,7 +109,7 @@ function calculateConfidence(data: ExtractedData | null): number {
 
 /**
  * Extract text from PDF using OCR.space API
- * Uses native fetch for lightweight serverless compatibility
+ * Uses native fetch with FormData for reliable large payload handling
  * Returns empty string on failure to prevent pipeline crashes
  */
 async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
@@ -116,8 +119,8 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
     // Convert PDF buffer to base64
     const base64Pdf = pdfBuffer.toString('base64');
 
-    // Create form data payload for OCR.space API
-    const formData = new URLSearchParams();
+    // Use native FormData instead of URLSearchParams (URLSearchParams corrupts large base64)
+    const formData = new FormData();
     formData.append('base64Image', 'data:application/pdf;base64,' + base64Pdf);
     formData.append('apikey', 'helloworld');
     formData.append('language', 'dut+eng'); // Dutch + English
@@ -126,10 +129,8 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
 
     const response = await fetch('https://api.ocr.space/parse/image', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: formData.toString(),
+      // CRITICAL: Do NOT set Content-Type header. Fetch sets multipart/form-data with boundary automatically.
+      body: formData,
     });
 
     if (!response.ok) {
