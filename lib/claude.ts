@@ -12,64 +12,33 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
 === CRITICAL: VENDOR NAME EXTRACTION ===
+The VENDOR is the company ISSUING the invoice (the seller/biller).
+The CUSTOMER is the company RECEIVING the invoice (the buyer).
 
-The VENDOR is the company ISSUING the invoice (the seller, receiving payment).
-The CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
-
-STRICT RULES FOR VENDOR NAME - READ CAREFULLY:
-
-1. NEVER extract alphanumeric order codes, customer codes, document IDs, or strings like "SCONL...", "INV...", "ORD..." as the Vendor Name. These are reference codes, NOT company names.
-
-2. Vendor names are typically standard company names found at:
-   - The very TOP of the document (headers), often next to a logo
-   - The BOTTOM of the document next to company registration details
-   - Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd."
-
-3. Watch for Dutch terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the vendor. For example, "e-Luscious Nederland B.V. iov Saeco.com" means the vendor is "Saeco" or "e-Luscious Nederland B.V."
-
-4. Do NOT extract names from tabular data under columns like "Klant", "Customer", "Order", "Debtor" - these are CUSTOMER fields, not vendor.
-
-5. If you see a company name repeated with a logo (like "Saeco" at the top), that is the vendor name.
-
-EXAMPLES OF CORRECT VENDOR EXTRACTION:
-✅ "Saeco" or "e-Luscious Nederland B.V." (not "SCONL0303006280999")
-✅ "Coolblue B.V." (not a customer code)
-✅ "Amazon Web Services, Inc." (not "AWS-12345")
+STRICT RULES FOR VENDOR NAME:
+1. POSITIONING: The Vendor name is typically the FIRST entity mentioned at the absolute top of the document (header). The Customer is usually listed further down, often under labels like "Bill To", "Factuuradres", "Sold To", or simply below the vendor's address. Do NOT extract the Customer as the Vendor.
+2. NO REFERENCE CODES: Do not extract alphanumeric order IDs, customer numbers, or document IDs as the Vendor Name. Real company names usually contain natural words and often end with legal entity suffixes (Inc., B.V., Ltd., LLC, Corp., AG, etc.).
+3. TABULAR DATA: Never extract the vendor name from data inside tables under columns like "Customer", "Klant", "Order", or "Client".
+4. CONTEXTUAL CLUES: Watch for international proxy terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the actual vendor entity.
 
 === TAX ID EXTRACTION ===
+Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW-nr"
+- The VENDOR's Tax ID is usually near the vendor's company name, footer, or issuer details.
+- Labels like "Uw BTW nummer", "Your VAT", or "Customer VAT" indicate the CUSTOMER's tax ID. Do NOT extract these.
+- Include country prefixes if present (e.g., FR, NL, DE, US).
+- If no vendor tax ID is clearly identifiable, return null.
 
-Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW nummer"
-
-CRITICAL: VENDOR vs CUSTOMER TAX ID
-- The VENDOR's Tax ID is usually near the vendor's company name/address
-- Look for labels like "Our VAT", "Our BTW", "VAT Number", "BTW-nr" (without "Uw" or "Your")
-- Labels like "Uw BTW nummer", "Your VAT", "Customer VAT" indicate the CUSTOMER's tax ID - NOT the vendor's
-- If you see "Uw BTW nummer" or similar, that is NOT the vendor tax ID
-
-IMPORTANT:
-- Prefer VAT/TIN over Service Tax numbers
-- Include country prefix if present: "FR63530848134", "NL810433941B01", "DE232446240"
-- If no vendor tax ID is clearly identifiable, return null
-
-=== AMOUNT EXTRACTION FROM TABLE LAYOUTS ===
-
-PDF text extraction often jumbles table columns. Be careful when extracting amounts:
-- Look for "Grand Total", "Total", "Totaal", "Factuur totaal" as the final amount
-- The subtotal should be the amount BEFORE tax
-- Tax amount is usually labeled "Tax", "BTW", "VAT", "CST"
-- Verify: subtotal + tax ≈ total (allow small rounding differences)
-
-COMMON EXTRACTION ERRORS TO AVOID:
-- Don't include digits from row numbers or product codes in amounts
-- If you see "1278.61" but "Grand Total: 319.00", the correct total is 319.00
-- Numbers appearing before "%CST" or similar are often tax percentages, not amounts
+=== AMOUNT EXTRACTION ===
+- Look for "Grand Total", "Total", "Totaal", "Factuur totaal" for the final amount.
+- Subtotal is the amount BEFORE tax.
+- Verify: subtotal + tax ≈ total.
+- Do not include digits from product codes or row numbers.
 
 === REQUIRED JSON OUTPUT ===
-
 Return ONLY a JSON object with these exact field names:
 {
   "invoiceNumber": "string",
-  "vendorName": "string (real company name like 'Saeco', NOT codes like 'SCONL...')",
+  "vendorName": "string",
   "vendorTaxId": "string or null",
   "issueDate": "YYYY-MM-DD",
   "dueDate": "YYYY-MM-DD or null",
@@ -171,7 +140,7 @@ function extractTaxIdFromOcrText(ocrText: string): string | null {
 
 /**
  * Extract vendor name from OCR text
- * Looks for company names with legal suffixes near issuer section
+ * Uses generic regex to find company names with legal suffixes
  */
 function extractVendorNameFromOcrText(ocrText: string): string | null {
   const lines = ocrText.split('\n');
@@ -180,24 +149,16 @@ function extractVendorNameFromOcrText(ocrText: string): string | null {
     const lowerLine = line.toLowerCase();
 
     // Skip lines that are clearly customer-related
-    if (lowerLine.includes('factuuradres') || lowerLine.includes('klant')) {
+    if (lowerLine.includes('factuuradres') || lowerLine.includes('klant') || lowerLine.includes('bill to')) {
       continue;
     }
 
-    // Look for issuer indicators
-    if (lowerLine.includes('e-luscious') || lowerLine.includes('saeco')) {
-      // Extract company name with suffix
-      const match = line.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.))/i);
-      if (match) {
-        return match[1].trim();
-      }
+    // Generic pattern to find company names with standard legal suffixes
+    // Matches capitalized words followed by B.V., Inc., GmbH, etc.
+    const match = line.match(/([A-Z][A-Za-z0-9& .\-]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.|LLC|Corp\.))/i);
+    if (match) {
+      return match[1].trim();
     }
-  }
-
-  // Fallback: look for any B.V. company
-  const bvMatch = ocrText.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG))/);
-  if (bvMatch) {
-    return bvMatch[1].trim();
   }
 
   return null;
