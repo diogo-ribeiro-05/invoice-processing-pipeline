@@ -29,7 +29,7 @@ STRICT RULES FOR VENDOR NAME:
 5. SHIPPING/CONTACT PERSONS: Names located under "Bill To", "Ship To", "Factuuradres", "Afleveradres", or "Klant" are ALWAYS the CUSTOMER or CONTACT PERSON. NEVER extract them as the Vendor.
 6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company") or lowercase individual contact names - these are NOT the vendor.
 7. TAGLINES & SLOGANS: Do not extract generic industry descriptions, taglines, or slogans (e.g., "Global Wholesaler", "Premium Services", "Logistics") as the Vendor Name. Look for the actual brand name.
-8. STRICT CUSTOMER AVOIDANCE: Any entity located below the vendor address or directly next to "T.a.v.", "Attn", or "Factuuradres" is the recipient. NEVER extract it, even if it has legal suffixes like "Corp" or "Inc".
+8. STRICT CUSTOMER AVOIDANCE: Any entity located directly AFTER the word "Factuuradres" (Invoice Address) or directly BEFORE the word "T.a.v." (Ter attentie van) is the CUSTOMER. NEVER extract it. The vendor will be somewhere else (often at the very top or in the OCR TEXT footer).
 9. OCR PRIORITY: If you find a brand name in the OCR TEXT (usually at the very top) and a different name in the DIGITAL TEXT recipient block, ALWAYS trust the OCR TEXT brand name as the Vendor.
 
 === TAX ID EXTRACTION ===
@@ -109,27 +109,28 @@ function calculateConfidence(data: ExtractedData | null): number {
 
 /**
  * Extract text from PDF using OCR.space API
- * Uses native fetch with FormData for reliable large payload handling
+ * Uses modern Node.js Blob for true binary file upload (much safer than base64)
  * Returns empty string on failure to prevent pipeline crashes
  */
 async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
   try {
     console.log('Starting OCR.space extraction...');
 
-    // Convert PDF buffer to base64
-    const base64Pdf = pdfBuffer.toString('base64');
-
-    // Use native FormData instead of URLSearchParams (URLSearchParams corrupts large base64)
+    // Use modern Node.js Blob for true binary file upload (much safer than base64)
+    // Convert Buffer to Uint8Array for Blob compatibility
+    const uint8Array = new Uint8Array(pdfBuffer);
+    const blob = new Blob([uint8Array], { type: 'application/pdf' });
     const formData = new FormData();
-    formData.append('base64Image', 'data:application/pdf;base64,' + base64Pdf);
+
+    // Append as a file rather than a base64 string
+    formData.append('file', blob, 'invoice.pdf');
     formData.append('apikey', 'helloworld');
-    formData.append('language', 'dut+eng'); // Dutch + English
-    formData.append('isOverlayRequired', 'false');
-    formData.append('OCREngine', '2'); // More accurate engine
+    formData.append('OCREngine', '2'); // Engine 2 is better for PDFs
+    // Note: Removed 'language: dut+eng' as forcing multiple languages can cause timeouts on the free tier.
+    // Engine 2 auto-detects characters well enough for Tax IDs.
 
     const response = await fetch('https://api.ocr.space/parse/image', {
       method: 'POST',
-      // CRITICAL: Do NOT set Content-Type header. Fetch sets multipart/form-data with boundary automatically.
       body: formData,
     });
 
