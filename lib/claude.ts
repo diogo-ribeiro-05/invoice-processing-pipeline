@@ -11,29 +11,47 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
-=== CRITICAL: VENDOR name extraction ===
+=== CRITICAL: VENDOR NAME EXTRACTION ===
 
 The VENDOR is the company ISSUING the invoice (the seller, receiving payment).
-    CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
+The CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
 
-HOW TO identify the VENDOR NAME:
-1. Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd.", "Corp", "Corporation"
-2. The vendor name appears WITH the company's address (street, city, country)
-3. The vendor is often near the TOP of the invoice or in the header
-4. Look for labels: "FROM", "SELLER", "VENDOR", "ISSUED BY", "Sold By"
+STRICT RULES FOR VENDOR NAME - READ CAREFULLY:
 
-WHAT IS not a VENDOR NAME:
-- Codes like "SCONL", "INV001", "FACT2022" - these are invoice reference codes, NOT company names
-- Generic words like "Invoice", "Factuur", "Bill"
-- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER", "Shipping Address", "Billing Address" sections - those are CUSTOMers
+1. NEVER extract alphanumeric order codes, customer codes, document IDs, or strings like "SCONL...", "INV...", "ORD..." as the Vendor Name. These are reference codes, NOT company names.
 
-- If you see "Uw BTW nummer" or similar - that is not the vendor tax ID
+2. Vendor names are typically standard company names found at:
+   - The very TOP of the document (headers), often next to a logo
+   - The BOTTOM of the document next to company registration details
+   - Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd."
 
-Look for company names with legal suffixes
-  if you see "BTW-nr" and that is the BTW number" without "Uw" or "Your")
-      return null
+3. Watch for Dutch terms like "iov" or "i.o.v." (in opdracht van = on behalf of) which indicate the vendor. For example, "e-Luscious Nederland B.V. iov Saeco.com" means the vendor is "Saeco" or "e-Luscious Nederland B.V."
 
-=== AMOUNT EXTRACTION from table LAYOUTs ===
+4. Do NOT extract names from tabular data under columns like "Klant", "Customer", "Order", "Debtor" - these are CUSTOMER fields, not vendor.
+
+5. If you see a company name repeated with a logo (like "Saeco" at the top), that is the vendor name.
+
+EXAMPLES OF CORRECT VENDOR EXTRACTION:
+✅ "Saeco" or "e-Luscious Nederland B.V." (not "SCONL0303006280999")
+✅ "Coolblue B.V." (not a customer code)
+✅ "Amazon Web Services, Inc." (not "AWS-12345")
+
+=== TAX ID EXTRACTION ===
+
+Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW nummer"
+
+CRITICAL: VENDOR vs CUSTOMER TAX ID
+- The VENDOR's Tax ID is usually near the vendor's company name/address
+- Look for labels like "Our VAT", "Our BTW", "VAT Number", "BTW-nr" (without "Uw" or "Your")
+- Labels like "Uw BTW nummer", "Your VAT", "Customer VAT" indicate the CUSTOMER's tax ID - NOT the vendor's
+- If you see "Uw BTW nummer" or similar, that is NOT the vendor tax ID
+
+IMPORTANT:
+- Prefer VAT/TIN over Service Tax numbers
+- Include country prefix if present: "FR63530848134", "NL810433941B01", "DE232446240"
+- If no vendor tax ID is clearly identifiable, return null
+
+=== AMOUNT EXTRACTION FROM TABLE LAYOUTS ===
 
 PDF text extraction often jumbles table columns. Be careful when extracting amounts:
 - Look for "Grand Total", "Total", "Totaal", "Factuur totaal" as the final amount
@@ -41,16 +59,17 @@ PDF text extraction often jumbles table columns. Be careful when extracting amou
 - Tax amount is usually labeled "Tax", "BTW", "VAT", "CST"
 - Verify: subtotal + tax ≈ total (allow small rounding differences)
 
-=== COMMON EXTRACTION ERRORS TO AVOID===
+COMMON EXTRACTION ERRORS TO AVOID:
 - Don't include digits from row numbers or product codes in amounts
-- If you see "1278.61" and "Grand Total: 319.00", the correct total is 319.00
-    Numbers appearing before "%CST" or similar are often tax percentages, not amounts
+- If you see "1278.61" but "Grand Total: 319.00", the correct total is 319.00
+- Numbers appearing before "%CST" or similar are often tax percentages, not amounts
 
 === REQUIRED JSON OUTPUT ===
+
 Return ONLY a JSON object with these exact field names:
 {
   "invoiceNumber": "string",
-  "vendorName": "string (real company name, not a code)",
+  "vendorName": "string (real company name like 'Saeco', NOT codes like 'SCONL...')",
   "vendorTaxId": "string or null",
   "issueDate": "YYYY-MM-DD",
   "dueDate": "YYYY-MM-DD or null",
@@ -60,6 +79,7 @@ Return ONLY a JSON object with these exact field names:
   "totalAmount": number,
   "lineItems": [{"description": "string", "quantity": number, "unitPrice": number, "total": number}]
 }
+
 INVOICE TEXT:
 `;
 
@@ -131,18 +151,18 @@ function extractTaxIdFromOcrText(ocrText: string): string | null {
   // Dutch VAT pattern: NL followed by digits and optional dots, then B01/B02 etc
   // Also handles German (DE), French (FR), Belgian (BE) formats
   const vatPatterns = [
-    /BTW-nr[:\s]*NL[\d.\s]+B\d{2}/i,
-    /NL[\d.\s]+B\d{2}/gi,
-    /DE[\d.\s]+B\d{2}/gi,
-    /FR[\d\s]+B\d{2}/gi,
-    /BE[0-9]\.?\d{3}\.?\d{3}/gi,
+    /BTW-nr[:\s]*(NL[\d.\s]+B\d{2})/i,
+    /(NL[\d.\s]+B\d{2})/gi,
+    /(DE[\d.\s]+B\d{2})/gi,
+    /(FR[\d\s]+B\d{2})/gi,
+    /(BE[0-9]\.?\d{3}\.?\d{3})/gi,
   ];
 
   for (const pattern of vatPatterns) {
     const match = ocrText.match(pattern);
-    if (match) {
-      // Normalize the Tax ID
-      return match[0].replace(/\s+/g, '').replace(/\./g, '.');
+    if (match && match[1]) {
+      // Normalize the Tax ID - remove spaces, keep dots in proper positions
+      return match[1].replace(/\s+/g, '').replace(/\./g, '.');
     }
   }
 
@@ -194,7 +214,14 @@ async function extractWithOcr(pdfBuffer: Buffer): Promise<{
   try {
     // Dynamic import for ESM modules
     const { pdf: pdfToImg } = await import('pdf-to-img');
-    const Tesseract = await import('tesseract.js');
+    const TesseractModule = await import('tesseract.js');
+    // Handle both ESM and CommonJS module structures
+    const recognize = TesseractModule.recognize || (TesseractModule as any).default?.recognize;
+
+    if (!recognize) {
+      console.error('OCR: Could not load Tesseract.recognize function');
+      return { vendorName: null, vendorTaxId: null };
+    }
 
     console.log('Starting OCR extraction...');
 
@@ -213,7 +240,7 @@ async function extractWithOcr(pdfBuffer: Buffer): Promise<{
     console.log(`OCR: Processing ${pageImages.length} page(s)...`);
 
     // Use first page for OCR
-    const ocrResult = await Tesseract.recognize(
+    const ocrResult = await recognize(
       pageImages[0],
       'nld+eng',
       {
