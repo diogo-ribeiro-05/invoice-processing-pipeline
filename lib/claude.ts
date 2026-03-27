@@ -20,25 +20,48 @@ HOW TO IDENTIFY THE VENDOR NAME:
 1. Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd.", "Corp", "Corporation"
 2. The vendor name appears WITH the company's address (street, city, country)
 3. The vendor is often near the TOP of the invoice or in the header
-4. Look for labels: "FROM", "SELLER", "VENDOR", "ISSUED BY"
+4. Look for labels: "FROM", "SELLER", "VENDOR", "ISSUED BY", "Sold By"
 
 ⚠️ WHAT IS NOT A VENDOR NAME:
 - Codes like "SCONL", "INV001", "FACT2022" - these are invoice reference codes, NOT company names
 - Generic words like "Invoice", "Factuur", "Bill"
-- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER" sections - those are CUSTOMERS
+- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER", "Shipping Address", "Billing Address" sections - those are CUSTOMERS
 
 EXAMPLES OF CORRECT EXTRACTION:
 ✅ "Strategic Corp" (real company name with address)
 ✅ "Coolblue B.V." (company with legal suffix)
 ✅ "Amazon Web Services, Inc." (company with legal suffix)
+✅ "WS Retail Services Pvt. Ltd." (company with legal suffix)
 ❌ "SCONL" (this is an invoice reference code, NOT a company)
 ❌ "Global Wholesaler" when it appears in a "BILL TO" section (that's the customer)
 
 === TAX ID EXTRACTION ===
 
-Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number"
+Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "VAT/TIN", "BTW nummer"
+
+⚠️ CRITICAL: VENDOR vs CUSTOMER TAX ID
+- The VENDOR's Tax ID is usually near the vendor's company name/address
+- Look for labels like "Our VAT", "Our BTW", "VAT Number", "BTW nummer" (without "Uw" or "Your")
+- Labels like "Uw BTW nummer", "Your VAT", "Customer VAT" indicate the CUSTOMER's tax ID - NOT the vendor's
+- If you see "Uw BTW nummer" or similar, that is NOT the vendor tax ID
+
+IMPORTANT:
 - Prefer VAT/TIN over Service Tax numbers
 - Include country prefix if present: "FR63530848134", "NL810433941B01", "DE232446240"
+- If no vendor tax ID is clearly identifiable, return null
+
+=== AMOUNT EXTRACTION FROM TABLE LAYOUTS ===
+
+PDF text extraction often jumbles table columns. Be careful when extracting amounts:
+- Look for "Grand Total", "Total", "Totaal", "Factuur totaal" as the final amount
+- The subtotal should be the amount BEFORE tax
+- Tax amount is usually labeled "Tax", "BTW", "VAT", "CST"
+- Verify: subtotal + tax ≈ total (allow small rounding differences)
+
+⚠️ COMMON EXTRACTION ERRORS TO AVOID:
+- Don't include digits from row numbers or product codes in amounts
+- If you see "1278.61" but "Grand Total: 319.00", the correct total is 319.00
+- Numbers appearing before "%CST" or similar are often tax percentages, not amounts
 
 === REQUIRED JSON OUTPUT ===
 
