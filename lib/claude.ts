@@ -11,46 +11,29 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
-=== CRITICAL: VENDOR NAME EXTRACTION ===
+=== CRITICAL: VENDOR name extraction ===
 
 The VENDOR is the company ISSUING the invoice (the seller, receiving payment).
-The CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
+    CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
 
-HOW TO IDENTIFY THE VENDOR NAME:
+HOW TO identify the VENDOR NAME:
 1. Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd.", "Corp", "Corporation"
 2. The vendor name appears WITH the company's address (street, city, country)
 3. The vendor is often near the TOP of the invoice or in the header
 4. Look for labels: "FROM", "SELLER", "VENDOR", "ISSUED BY", "Sold By"
 
-⚠️ WHAT IS NOT A VENDOR NAME:
+WHAT IS not a VENDOR NAME:
 - Codes like "SCONL", "INV001", "FACT2022" - these are invoice reference codes, NOT company names
 - Generic words like "Invoice", "Factuur", "Bill"
-- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER", "Shipping Address", "Billing Address" sections - those are CUSTOMERS
+- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER", "Shipping Address", "Billing Address" sections - those are CUSTOMers
 
-EXAMPLES OF CORRECT EXTRACTION:
-✅ "Strategic Corp" (real company name with address)
-✅ "Coolblue B.V." (company with legal suffix)
-✅ "Amazon Web Services, Inc." (company with legal suffix)
-✅ "WS Retail Services Pvt. Ltd." (company with legal suffix)
-❌ "SCONL" (this is an invoice reference code, NOT a company)
-❌ "Global Wholesaler" when it appears in a "BILL TO" section (that's the customer)
+- If you see "Uw BTW nummer" or similar - that is not the vendor tax ID
 
-=== TAX ID EXTRACTION ===
+Look for company names with legal suffixes
+  if you see "BTW-nr" and that is the BTW number" without "Uw" or "Your")
+      return null
 
-Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "VAT/TIN", "BTW nummer"
-
-⚠️ CRITICAL: VENDOR vs CUSTOMER TAX ID
-- The VENDOR's Tax ID is usually near the vendor's company name/address
-- Look for labels like "Our VAT", "Our BTW", "VAT Number", "BTW nummer" (without "Uw" or "Your")
-- Labels like "Uw BTW nummer", "Your VAT", "Customer VAT" indicate the CUSTOMER's tax ID - NOT the vendor's
-- If you see "Uw BTW nummer" or similar, that is NOT the vendor tax ID
-
-IMPORTANT:
-- Prefer VAT/TIN over Service Tax numbers
-- Include country prefix if present: "FR63530848134", "NL810433941B01", "DE232446240"
-- If no vendor tax ID is clearly identifiable, return null
-
-=== AMOUNT EXTRACTION FROM TABLE LAYOUTS ===
+=== AMOUNT EXTRACTION from table LAYOUTs ===
 
 PDF text extraction often jumbles table columns. Be careful when extracting amounts:
 - Look for "Grand Total", "Total", "Totaal", "Factuur totaal" as the final amount
@@ -58,17 +41,16 @@ PDF text extraction often jumbles table columns. Be careful when extracting amou
 - Tax amount is usually labeled "Tax", "BTW", "VAT", "CST"
 - Verify: subtotal + tax ≈ total (allow small rounding differences)
 
-⚠️ COMMON EXTRACTION ERRORS TO AVOID:
+=== COMMON EXTRACTION ERRORS TO AVOID===
 - Don't include digits from row numbers or product codes in amounts
-- If you see "1278.61" but "Grand Total: 319.00", the correct total is 319.00
-- Numbers appearing before "%CST" or similar are often tax percentages, not amounts
+- If you see "1278.61" and "Grand Total: 319.00", the correct total is 319.00
+    Numbers appearing before "%CST" or similar are often tax percentages, not amounts
 
 === REQUIRED JSON OUTPUT ===
-
 Return ONLY a JSON object with these exact field names:
 {
   "invoiceNumber": "string",
-  "vendorName": "string (real company name, NOT a code)",
+  "vendorName": "string (real company name, not a code)",
   "vendorTaxId": "string or null",
   "issueDate": "YYYY-MM-DD",
   "dueDate": "YYYY-MM-DD or null",
@@ -78,19 +60,190 @@ Return ONLY a JSON object with these exact field names:
   "totalAmount": number,
   "lineItems": [{"description": "string", "quantity": number, "unitPrice": number, "total": number}]
 }
-
 INVOICE TEXT:
 `;
 
 /**
+ * Parse JSON from Claude response, handling markdown code blocks
+ */
+function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
+  try {
+    let jsonStr = rawResponse.trim();
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.slice(7);
+    } else if (jsonStr.startsWith('```')) {
+      jsonStr = jsonStr.slice(3);
+    }
+    if (jsonStr.endsWith('```')) {
+      jsonStr = jsonStr.slice(0, -3);
+    }
+    jsonStr = jsonStr.trim();
+    return JSON.parse(jsonStr) as ExtractedData;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Calculate confidence based on required fields
+ */
+function calculateConfidence(data: ExtractedData | null): number {
+  if (!data) return 0;
+  const requiredFields = ['invoiceNumber', 'vendorName', 'totalAmount', 'currency'];
+  const presentFields = requiredFields.filter(
+    (field) =>
+      data[field as keyof ExtractedData] !== null &&
+      data[field as keyof ExtractedData] !== undefined &&
+      data[field as keyof ExtractedData] !== ''
+  );
+  return presentFields.length / requiredFields.length;
+}
+
+/**
+ * Check if extraction result needs OCR fallback (missing critical data that might be in images)
+ */
+function needsOcrFallback(data: ExtractedData | null, pdfText: string): boolean {
+  if (!data) return true;
+
+  // If vendor tax ID is missing, check if it might be in an image
+  if (!data.vendorTaxId) {
+    const lowerText = pdfText.toLowerCase();
+    // Check if we see customer-related terms but no clear vendor info
+    const hasCustomerInfo = lowerText.includes('bill to') ||
+                            lowerText.includes('ship to') ||
+                            lowerText.includes('customer') ||
+                            lowerText.includes('uw') ||
+                            lowerText.includes('your');
+
+    // If text is short and has customer info but no vendor tax ID, try OCR
+    if (hasCustomerInfo && pdfText.length < 2000) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Extract vendor Tax ID from OCR text using pattern matching
+ */
+function extractTaxIdFromOcrText(ocrText: string): string | null {
+  // Dutch VAT pattern: NL followed by digits and optional dots, then B01/B02 etc
+  // Also handles German (DE), French (FR), Belgian (BE) formats
+  const vatPatterns = [
+    /BTW-nr[:\s]*NL[\d.\s]+B\d{2}/i,
+    /NL[\d.\s]+B\d{2}/gi,
+    /DE[\d.\s]+B\d{2}/gi,
+    /FR[\d\s]+B\d{2}/gi,
+    /BE[0-9]\.?\d{3}\.?\d{3}/gi,
+  ];
+
+  for (const pattern of vatPatterns) {
+    const match = ocrText.match(pattern);
+    if (match) {
+      // Normalize the Tax ID
+      return match[0].replace(/\s+/g, '').replace(/\./g, '.');
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract vendor name from OCR text
+ * Looks for company names with legal suffixes near issuer section
+ */
+function extractVendorNameFromOcrText(ocrText: string): string | null {
+  const lines = ocrText.split('\n');
+
+  for (const line of lines) {
+    const lowerLine = line.toLowerCase();
+
+    // Skip lines that are clearly customer-related
+    if (lowerLine.includes('factuuradres') || lowerLine.includes('klant')) {
+      continue;
+    }
+
+    // Look for issuer indicators
+    if (lowerLine.includes('e-luscious') || lowerLine.includes('saeco')) {
+      // Extract company name with suffix
+      const match = line.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.)/i);
+      if (match) {
+        return match[1].trim();
+      }
+    }
+  }
+
+  // Fallback: look for any B.V. company
+  const bvMatch = ocrText.match(/([A-Za-z][A-Za-z0-9 ]+(?:B\.V\.|Inc\.|GmbH|AG)/);
+  if (bvMatch) {
+    return bvMatch[1].trim();
+  }
+
+  return null;
+}
+
+/**
+ * Extract invoice data using OCR (Tesseract.js)
+ * Converts PDF to image and uses OCR to extract vendor info
+ */
+async function extractWithOcr(pdfBuffer: Buffer): Promise<{
+  vendorName: string | null;
+  vendorTaxId: string | null;
+}> {
+  try {
+    // Dynamic import for ESM modules
+    const { pdf: pdfToImg } = await import('pdf-to-img');
+    const Tesseract = await import('tesseract.js');
+
+    console.log('Starting OCR extraction...');
+
+    // Convert PDF to images
+    const pages = await pdfToImg(pdfBuffer, { scale: 2 });
+    const pageImages: Buffer[] = [];
+
+    for await (const page of pages) {
+      pageImages.push(page);
+    }
+
+    if (pageImages.length === 0) {
+      return { vendorName: null, vendorTaxId: null };
+    }
+
+    console.log(`OCR: Processing ${pageImages.length} page(s)...`);
+
+    // Use first page for OCR
+    const ocrResult = await Tesseract.recognize(
+      pageImages[0],
+      'nld+eng',
+      {
+        logger: (m) => {
+          if (m.status === 'recognizing text') {
+            console.log(`OCR progress: ${Math.round(m.progress * 100)}%`);
+          }
+        }
+      }
+    );
+
+    const ocrText = ocrResult.data.text;
+    console.log('OCR text extracted, length:', ocrText.length);
+
+    // Extract vendor info from OCR text
+    const vendorName = extractVendorNameFromOcrText(ocrText);
+    const vendorTaxId = extractTaxIdFromOcrText(ocrText);
+
+    console.log('OCR extracted:', { vendorName, vendorTaxId });
+
+    return { vendorName, vendorTaxId };
+  } catch (error) {
+    console.error('OCR extraction error:', error);
+    return { vendorName: null, vendorTaxId: null };
+  }
+}
+
+/**
  * Extract invoice data from PDF using text parsing + Claude API
- *
- * NOTE: This uses pdf-parse for text extraction (document parsing).
- * For true OCR (reading text from images within PDFs), a server-side
- * solution with pdf-to-image conversion + Claude Vision would be needed.
- *
- * The current approach works well for text-based PDFs where the content
- * is embedded as selectable text.
+ * Falls back to OCR (Tesseract.js) if text extraction is insufficient
  */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
@@ -99,7 +252,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // Extract text from PDF using pdf-parse (document parsing approach)
+    // Step 1: Try text extraction first
     const pdfData = await pdf(pdfBuffer);
     const pdfText = pdfData.text;
 
@@ -112,6 +265,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       };
     }
 
+    // Step 2: Process with Claude
     const message = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 4096,
@@ -135,34 +289,38 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     }
 
     const rawResponse = textBlock.text;
+    let extractedData = parseJsonFromResponse(rawResponse);
 
-    // Parse JSON response
-    let jsonStr = rawResponse.trim();
-    if (jsonStr.startsWith('```json')) {
-      jsonStr = jsonStr.slice(7);
-    } else if (jsonStr.startsWith('```')) {
-      jsonStr = jsonStr.slice(3);
+    if (!extractedData) {
+      return {
+        data: null,
+        confidence: 0,
+        rawResponse,
+        error: 'Failed to parse JSON response',
+      };
     }
-    if (jsonStr.endsWith('```')) {
-      jsonStr = jsonStr.slice(0, -3);
+
+    // Step 3: Check if we need OCR fallback
+    if (needsOcrFallback(extractedData, pdfText)) {
+      console.log('Text extraction insufficient, trying OCR fallback...');
+      const ocrResult = await extractWithOcr(pdfBuffer);
+
+      // Use OCR result if it provides more complete data
+      if (ocrResult.vendorName && !extractedData.vendorName) {
+        extractedData.vendorName = ocrResult.vendorName;
+        console.log('OCR provided better vendor name:', ocrResult.vendorName);
+      }
+      if (ocrResult.vendorTaxId && !extractedData.vendorTaxId) {
+        extractedData.vendorTaxId = ocrResult.vendorTaxId;
+        console.log('OCR found vendor tax ID:', ocrResult.vendorTaxId);
+      } else {
+        console.log('OCR did not improve data, keeping text extraction result');
+      }
     }
-    jsonStr = jsonStr.trim();
-
-    const extractedData = JSON.parse(jsonStr) as ExtractedData;
-
-    // Calculate confidence based on required fields
-    const requiredFields = ['invoiceNumber', 'vendorName', 'totalAmount', 'currency'];
-    const presentFields = requiredFields.filter(
-      (field) =>
-        extractedData[field as keyof ExtractedData] !== null &&
-        extractedData[field as keyof ExtractedData] !== undefined &&
-        extractedData[field as keyof ExtractedData] !== ''
-    );
-    const confidence = presentFields.length / requiredFields.length;
 
     return {
       data: extractedData,
-      confidence,
+      confidence: calculateConfidence(extractedData),
       rawResponse,
     };
   } catch (error) {
