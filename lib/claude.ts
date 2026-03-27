@@ -11,6 +11,12 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
+=== INPUT FORMAT ===
+You are provided with both DIGITAL TEXT and OCR TEXT. Cross-reference them to build the final JSON:
+- VENDOR NAMES and TAX IDs are often found in the OCR TEXT (extracted from image logos at the header or footers).
+- TABULAR DATA, line items, and exact amounts are usually more accurate in the DIGITAL TEXT.
+- PRIORITIZE OCR TEXT for company identity if it looks like a valid legal entity (with suffixes like B.V., Inc., GmbH, etc.).
+
 === CRITICAL: VENDOR NAME EXTRACTION ===
 The VENDOR is the company ISSUING the invoice (the seller/biller).
 The CUSTOMER is the company RECEIVING the invoice (the buyer).
@@ -99,149 +105,61 @@ function calculateConfidence(data: ExtractedData | null): number {
 }
 
 /**
- * Check if extraction result needs OCR fallback (missing critical data that might be in images)
+ * Extract text from PDF using OCR.space API
+ * Uses native fetch for lightweight serverless compatibility
+ * Returns empty string on failure to prevent pipeline crashes
  */
-function needsOcrFallback(data: ExtractedData | null, pdfText: string): boolean {
-  if (!data) return true;
-
-  // If vendor tax ID is missing, check if it might be in an image
-  if (!data.vendorTaxId) {
-    const lowerText = pdfText.toLowerCase();
-    // Check if we see customer-related terms but no clear vendor info
-    const hasCustomerInfo = lowerText.includes('bill to') ||
-                            lowerText.includes('ship to') ||
-                            lowerText.includes('customer') ||
-                            lowerText.includes('uw') ||
-                            lowerText.includes('your');
-
-    // If text is short and has customer info but no vendor tax ID, try OCR
-    if (hasCustomerInfo && pdfText.length < 2000) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
- * Extract vendor Tax ID from OCR text using pattern matching
- */
-function extractTaxIdFromOcrText(ocrText: string): string | null {
-  // Dutch VAT pattern: NL followed by digits and optional dots, then B01/B02 etc
-  // Also handles German (DE), French (FR), Belgian (BE) formats
-  const vatPatterns = [
-    /BTW-nr[:\s]*(NL[\d.\s]+B\d{2})/i,
-    /(NL[\d.\s]+B\d{2})/gi,
-    /(DE[\d.\s]+B\d{2})/gi,
-    /(FR[\d\s]+B\d{2})/gi,
-    /(BE[0-9]\.?\d{3}\.?\d{3})/gi,
-  ];
-
-  for (const pattern of vatPatterns) {
-    const match = ocrText.match(pattern);
-    if (match && match[1]) {
-      // Normalize the Tax ID - remove spaces, keep dots in proper positions
-      return match[1].replace(/\s+/g, '').replace(/\./g, '.');
-    }
-  }
-
-  return null;
-}
-
-/**
- * Extract vendor name from OCR text
- * Uses generic regex to find company names with legal suffixes
- */
-function extractVendorNameFromOcrText(ocrText: string): string | null {
-  const lines = ocrText.split('\n');
-
-  for (const line of lines) {
-    const lowerLine = line.toLowerCase();
-
-    // Skip lines that are clearly customer-related
-    if (lowerLine.includes('factuuradres') || lowerLine.includes('klant') || lowerLine.includes('bill to')) {
-      continue;
-    }
-
-    // Generic pattern to find company names with standard legal suffixes
-    // Matches capitalized words followed by B.V., Inc., GmbH, etc.
-    const match = line.match(/([A-Z][A-Za-z0-9& .\-]+(?:B\.V\.|Inc\.|GmbH|AG|SAS|Pvt\. Ltd\.|LLC|Corp\.))/i);
-    if (match) {
-      return match[1].trim();
-    }
-  }
-
-  return null;
-}
-
-/**
- * Extract invoice data using OCR (Tesseract.js)
- * Converts PDF to image and uses OCR to extract vendor info
- */
-async function extractWithOcr(pdfBuffer: Buffer): Promise<{
-  vendorName: string | null;
-  vendorTaxId: string | null;
-}> {
+async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
   try {
-    // Dynamic import for ESM modules
-    const { pdf: pdfToImg } = await import('pdf-to-img');
-    const TesseractModule = await import('tesseract.js');
-    // Handle both ESM and CommonJS module structures
-    const recognize = TesseractModule.recognize || (TesseractModule as any).default?.recognize;
+    console.log('Starting OCR.space extraction...');
 
-    if (!recognize) {
-      console.error('OCR: Could not load Tesseract.recognize function');
-      return { vendorName: null, vendorTaxId: null };
+    // Convert PDF buffer to base64
+    const base64Pdf = pdfBuffer.toString('base64');
+
+    // Create form data payload for OCR.space API
+    const formData = new URLSearchParams();
+    formData.append('base64Image', 'data:application/pdf;base64,' + base64Pdf);
+    formData.append('apikey', 'helloworld');
+    formData.append('language', 'dut+eng'); // Dutch + English
+    formData.append('isOverlayRequired', 'false');
+    formData.append('OCREngine', '2'); // More accurate engine
+
+    const response = await fetch('https://api.ocr.space/parse/image', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: formData.toString(),
+    });
+
+    if (!response.ok) {
+      console.error('OCR.space API error:', response.status, response.statusText);
+      return '';
     }
 
-    console.log('Starting OCR extraction...');
+    const result = await response.json() as {
+      ParsedResults?: Array<{ ParsedText?: string }>;
+      ErrorMessage?: string;
+    };
 
-    // Convert PDF to images
-    const pages = await pdfToImg(pdfBuffer, { scale: 2 });
-    const pageImages: Buffer[] = [];
-
-    for await (const page of pages) {
-      pageImages.push(page);
+    if (result.ErrorMessage) {
+      console.error('OCR.space error message:', result.ErrorMessage);
+      return '';
     }
 
-    if (pageImages.length === 0) {
-      return { vendorName: null, vendorTaxId: null };
-    }
+    const ocrText = result.ParsedResults?.[0]?.ParsedText || '';
+    console.log('OCR.space extracted text length:', ocrText.length);
 
-    console.log(`OCR: Processing ${pageImages.length} page(s)...`);
-
-    // Use first page for OCR
-    const ocrResult = await recognize(
-      pageImages[0],
-      'nld+eng',
-      {
-        logger: (m) => {
-          if (m.status === 'recognizing text') {
-            console.log(`OCR progress: ${Math.round(m.progress * 100)}%`);
-          }
-        }
-      }
-    );
-
-    const ocrText = ocrResult.data.text;
-    console.log('OCR text extracted, length:', ocrText.length);
-
-    // Extract vendor info from OCR text
-    const vendorName = extractVendorNameFromOcrText(ocrText);
-    const vendorTaxId = extractTaxIdFromOcrText(ocrText);
-
-    console.log('OCR extracted:', { vendorName, vendorTaxId });
-
-    return { vendorName, vendorTaxId };
+    return ocrText;
   } catch (error) {
-    console.error('OCR extraction error:', error);
-    return { vendorName: null, vendorTaxId: null };
+    console.error('OCR.space extraction error:', error);
+    return '';
   }
 }
 
 /**
- * Extract invoice data from PDF using text parsing + Claude API
- * Falls back to OCR (Tesseract.js) if text extraction is insufficient
+ * Extract invoice data from PDF using concurrent text extraction + OCR
+ * Runs pdf-parse and OCR.space in parallel, then merges results for LLM processing
  */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
@@ -250,8 +168,14 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // Step 1: Try text extraction first
-    const pdfData = await pdf(pdfBuffer);
+    // Step 1: Run digital text extraction and OCR concurrently
+    console.log('Starting concurrent extraction (pdf-parse + OCR.space)...');
+
+    const [pdfData, ocrText] = await Promise.all([
+      pdf(pdfBuffer),
+      extractWithOcrSpace(pdfBuffer),
+    ]);
+
     const pdfText = pdfData.text;
 
     if (!pdfText || pdfText.trim().length === 0) {
@@ -263,14 +187,20 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       };
     }
 
-    // Step 2: Process with Claude
+    // Step 2: Merge results into combined text for LLM
+    const combinedText = "--- DIGITAL TEXT ---\n" + pdfText +
+                         "\n\n--- OCR TEXT ---\n" + ocrText;
+
+    console.log('Combined text length:', combinedText.length);
+
+    // Step 3: Process with LLM
     const message = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 4096,
       messages: [
         {
           role: 'user',
-          content: EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
+          content: EXTRACTION_PROMPT + '\n\n' + combinedText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
         },
       ],
     });
@@ -287,7 +217,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     }
 
     const rawResponse = textBlock.text;
-    let extractedData = parseJsonFromResponse(rawResponse);
+    const extractedData = parseJsonFromResponse(rawResponse);
 
     if (!extractedData) {
       return {
@@ -296,23 +226,6 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
         rawResponse,
         error: 'Failed to parse JSON response',
       };
-    }
-
-    // Step 3: Check if we need OCR fallback
-    if (needsOcrFallback(extractedData, pdfText)) {
-      console.log('Text extraction insufficient, trying OCR fallback...');
-      const ocrResult = await extractWithOcr(pdfBuffer);
-
-      // OCR regex finds strict legal entity matches, so prefer OCR results over LLM guesses
-      // The LLM often extracts contact persons or placeholder names incorrectly
-      if (ocrResult.vendorName) {
-        extractedData.vendorName = ocrResult.vendorName;
-        console.log('OCR provided better vendor name:', ocrResult.vendorName);
-      }
-      if (ocrResult.vendorTaxId) {
-        extractedData.vendorTaxId = ocrResult.vendorTaxId;
-        console.log('OCR found vendor tax ID:', ocrResult.vendorTaxId);
-      }
     }
 
     return {
