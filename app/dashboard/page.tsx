@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import type { ProcessedInvoice, DashboardStats } from '@/lib/types';
 import StatsCard from '@/components/StatsCard';
 import InvoiceTable from '@/components/InvoiceTable';
@@ -14,7 +15,10 @@ interface ProgressState {
   message: string;
 }
 
+type FilterType = 'all' | 'matched' | 'flagged';
+
 export default function DashboardPage() {
+  const router = useRouter();
   const [invoices, setInvoices] = useState<ProcessedInvoice[]>([]);
   const [selectedInvoice, setSelectedInvoice] = useState<ProcessedInvoice | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -22,6 +26,7 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
+  const [filter, setFilter] = useState<FilterType>('all');
   const [stats, setStats] = useState<DashboardStats>({
     totalInvoices: 0,
     matchedVendors: 0,
@@ -189,6 +194,15 @@ export default function DashboardPage() {
     }
   }
 
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' })
+      router.push('/login')
+    } catch (err) {
+      console.error('Logout failed:', err)
+    }
+  }
+
   const formatCurrency = (amount: number, currency: string) => {
     try {
       return new Intl.NumberFormat('en-US', {
@@ -204,16 +218,37 @@ export default function DashboardPage() {
 
   const progressPercent = progress ? Math.round((progress.current / progress.total) * 100) : 0
 
+  // Filter invoices based on selected filter
+  const filteredInvoices = invoices.filter((inv) => {
+    if (filter === 'all') return true
+    const notes = inv.processingNotes?.toLowerCase() || ''
+    const isMatched = notes.includes('fully validated') &&
+      !notes.includes('not found') &&
+      !notes.includes('missing') &&
+      !notes.includes('mismatch') &&
+      !notes.includes('error')
+    return filter === 'matched' ? isMatched : !isMatched
+  })
+
   return (
     <div className="min-h-screen bg-gray-100">
       {/* Header */}
       <header className="border-b border-gray-200 bg-white shadow-sm">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Invoice Processing Pipeline</h1>
-            <p className="mt-1 text-sm text-gray-500">Portline Logistics - Finance Dashboard</p>
+          <div className="flex items-center gap-6">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">Invoice Processing Pipeline</h1>
+              <p className="mt-1 text-sm text-gray-500">Portline Logistics - Finance Dashboard</p>
+            </div>
           </div>
-          <div className="flex gap-3">
+          <div className="flex items-center gap-6">
+            <button
+              onClick={handleLogout}
+              className="text-sm font-medium text-gray-600 hover:text-gray-900"
+            >
+              Logout
+            </button>
+            <div className="h-6 w-px bg-gray-300" />
             <button
               onClick={handleReset}
               disabled={isLoading || isProcessing}
@@ -286,18 +321,24 @@ export default function DashboardPage() {
             value={stats.totalInvoices}
             subtitle="processed"
             color="blue"
+            onClick={() => setFilter('all')}
+            isActive={filter === 'all'}
           />
           <StatsCard
             title="Matched Vendors"
             value={stats.matchedVendors}
             subtitle="validated"
             color="green"
+            onClick={() => setFilter('matched')}
+            isActive={filter === 'matched'}
           />
           <StatsCard
             title="Flagged Issues"
             value={stats.flaggedIssues}
             subtitle="need attention"
             color="yellow"
+            onClick={() => setFilter('flagged')}
+            isActive={filter === 'flagged'}
           />
         </div>
 
@@ -318,10 +359,25 @@ export default function DashboardPage() {
           </div>
         )}
 
+        {/* Filter indicator */}
+        {filter !== 'all' && (
+          <div className="mb-4 flex items-center gap-2">
+            <span className="text-sm text-gray-600">
+              Showing {filter === 'matched' ? 'matched vendors' : 'flagged issues'} ({filteredInvoices.length} invoices)
+            </span>
+            <button
+              onClick={() => setFilter('all')}
+              className="text-sm font-medium text-blue-600 hover:text-blue-800"
+            >
+              Clear filter
+            </button>
+          </div>
+        )}
+
         {/* Invoices Table */}
         <div className="relative">
           <InvoiceTable
-            invoices={invoices}
+            invoices={filteredInvoices}
             onSelectInvoice={setSelectedInvoice}
             selectedId={selectedInvoice?.id}
             isLoading={isLoading}

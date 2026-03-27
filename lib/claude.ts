@@ -9,33 +9,66 @@ const anthropic = new Anthropic({
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
 
-const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice text.
+const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
-IMPORTANT INSTRUCTIONS:
-1. Extract ALL available information from the invoice text below
-2. Handle multiple languages (English, Dutch, French, German)
-3. Handle multiple currencies (USD, EUR, INR, etc.)
-4. If a field is not found, use null or empty string
-5. For amounts, extract the numeric value only (no currency symbols)
-6. For dates, use ISO 8601 format (YYYY-MM-DD)
-7. Be precise with vendor names - extract the exact company name that issued the invoice
-8. Look for the "from" or "seller" or "vendor" section to identify the company name
+=== CRITICAL: VENDOR NAME EXTRACTION ===
 
-Extract the following fields:
-- invoiceNumber: The invoice/document number
-- vendorName: Full company/vendor name as shown (the company ISSUING the invoice, not receiving it)
-- vendorTaxId: Tax ID (VAT number, GSTIN, etc.) - include the country prefix if present (e.g., "US-XXX", "DE-XXX", "NL-XXX")
-- issueDate: Invoice/issue date in YYYY-MM-DD format
-- dueDate: Payment due date in YYYY-MM-DD format (null if not present)
-- currency: 3-letter currency code (USD, EUR, INR, etc.)
-- subtotal: Amount before tax
-- taxAmount: Tax amount (VAT, GST, etc.)
-- totalAmount: Total amount including tax
-- lineItems: Array of line items with description, quantity, unitPrice, and total
+The VENDOR is the company ISSUING the invoice (the seller, receiving payment).
+The CUSTOMER is the company RECEIVING the invoice (the buyer, making payment).
+
+HOW TO IDENTIFY THE VENDOR NAME:
+1. Look for company names with legal suffixes: "B.V.", "Inc.", "AG", "SAS", "Pvt. Ltd.", "GmbH", "Ltd.", "Corp", "Corporation"
+2. The vendor name appears WITH the company's address (street, city, country)
+3. The vendor is often near the TOP of the invoice or in the header
+4. Look for labels: "FROM", "SELLER", "VENDOR", "ISSUED BY"
+
+⚠️ WHAT IS NOT A VENDOR NAME:
+- Codes like "SCONL", "INV001", "FACT2022" - these are invoice reference codes, NOT company names
+- Generic words like "Invoice", "Factuur", "Bill"
+- Names that appear in "BILL TO", "SHIP TO", "CUSTOMER" sections - those are CUSTOMERS
+
+EXAMPLES OF CORRECT EXTRACTION:
+✅ "Strategic Corp" (real company name with address)
+✅ "Coolblue B.V." (company with legal suffix)
+✅ "Amazon Web Services, Inc." (company with legal suffix)
+❌ "SCONL" (this is an invoice reference code, NOT a company)
+❌ "Global Wholesaler" when it appears in a "BILL TO" section (that's the customer)
+
+=== TAX ID EXTRACTION ===
+
+Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number"
+- Prefer VAT/TIN over Service Tax numbers
+- Include country prefix if present: "FR63530848134", "NL810433941B01", "DE232446240"
+
+=== REQUIRED JSON OUTPUT ===
+
+Return ONLY a JSON object with these exact field names:
+{
+  "invoiceNumber": "string",
+  "vendorName": "string (real company name, NOT a code)",
+  "vendorTaxId": "string or null",
+  "issueDate": "YYYY-MM-DD",
+  "dueDate": "YYYY-MM-DD or null",
+  "currency": "USD/EUR/INR/etc",
+  "subtotal": number,
+  "taxAmount": number or null,
+  "totalAmount": number,
+  "lineItems": [{"description": "string", "quantity": number, "unitPrice": number, "total": number}]
+}
 
 INVOICE TEXT:
 `;
 
+/**
+ * Extract invoice data from PDF using text parsing + Claude API
+ *
+ * NOTE: This uses pdf-parse for text extraction (document parsing).
+ * For true OCR (reading text from images within PDFs), a server-side
+ * solution with pdf-to-image conversion + Claude Vision would be needed.
+ *
+ * The current approach works well for text-based PDFs where the content
+ * is embedded as selectable text.
+ */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
   confidence: number;
@@ -43,7 +76,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // First extract text from PDF using pdf-parse
+    // Extract text from PDF using pdf-parse (document parsing approach)
     const pdfData = await pdf(pdfBuffer);
     const pdfText = pdfData.text;
 
@@ -81,7 +114,6 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     const rawResponse = textBlock.text;
 
     // Parse JSON response
-    // Handle potential markdown code blocks
     let jsonStr = rawResponse.trim();
     if (jsonStr.startsWith('```json')) {
       jsonStr = jsonStr.slice(7);

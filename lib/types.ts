@@ -68,6 +68,12 @@ export interface DeleteResponse {
   deleted: number;
 }
 
+// Auth Types
+export interface User {
+  username: string;
+  [key: string]: string | undefined;
+}
+
 // Dashboard Stats
 export interface DashboardStats {
   totalInvoices: number;
