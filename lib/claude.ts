@@ -345,6 +345,9 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
 
     console.log('PASS 1 complete. Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
 
+    // Track OCR text for combined search in post-processing
+    let ocrText = '';
+
     // ========================================
     // VALIDATION: Check if OCR patch needed
     // ========================================
@@ -354,7 +357,7 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       // ========================================
       console.log('PASS 2: OCR patch needed - extracting from images...');
 
-      const ocrText = await extractWithOcrSpace(pdfBuffer);
+      ocrText = await extractWithOcrSpace(pdfBuffer);
 
       if (ocrText && ocrText.trim().length > 0) {
         // Extract ONLY vendorName and vendorTaxId from OCR text
@@ -390,13 +393,18 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       if (erpCompany) {
         console.log('ERP found company by Tax ID:', erpCompany.name);
 
-        // Check if the official ERP name appears in the PDF text
-        if (isCompanyNameInText(erpCompany.name, pdfText)) {
-          console.log('Official ERP name found in PDF - updating vendorName');
+        // Combine digital text AND OCR text for comprehensive search
+        // The official company name might be in either source
+        const combinedSearchText = pdfText + '\n' + ocrText;
+        console.log('Searching in combined text (digital + OCR), total length:', combinedSearchText.length);
+
+        // Check if the official ERP name appears in the combined text
+        if (isCompanyNameInText(erpCompany.name, combinedSearchText)) {
+          console.log('Official ERP name found in text - updating vendorName');
           console.log('Replacing:', extractedData.vendorName, '→', erpCompany.name);
           extractedData.vendorName = erpCompany.name;
         } else {
-          console.log('Official ERP name NOT found in PDF - keeping extracted name');
+          console.log('Official ERP name NOT found in combined text - keeping extracted name');
         }
       } else {
         console.log('Tax ID not found in ERP - keeping extracted vendor name');

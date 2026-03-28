@@ -77,15 +77,18 @@ export async function findCompanyByTaxId(taxId: string): Promise<Company | null>
 }
 
 /**
- * Fuzzy search for a company name in PDF text
- * Handles variations like "Pvt" vs "Private", case differences, etc.
+ * Fuzzy search for a company name in PDF/OCR text
+ * Handles variations like "Pvt" vs "Private", case differences, hyphens, etc.
+ *
+ * @param companyName - The official company name from ERP
+ * @param combinedText - Combined digital text AND OCR text for comprehensive search
  */
-export function isCompanyNameInText(companyName: string, pdfText: string): boolean {
-  if (!companyName || !pdfText) {
+export function isCompanyNameInText(companyName: string, combinedText: string): boolean {
+  if (!companyName || !combinedText) {
     return false;
   }
 
-  const lowerText = pdfText.toLowerCase();
+  const lowerText = combinedText.toLowerCase();
   const lowerName = companyName.toLowerCase();
 
   // Direct match
@@ -93,34 +96,57 @@ export function isCompanyNameInText(companyName: string, pdfText: string): boole
     return true;
   }
 
-  // Normalize common variations for fuzzy matching
-  const normalizedText = lowerText
-    .replace(/private\s*limited/gi, 'pvt ltd')
-    .replace(/private\s*ltd/gi, 'pvt ltd')
-    .replace(/pvt\.?\s*limited/gi, 'pvt ltd')
-    .replace(/limited/gi, 'ltd')
-    .replace(/\./g, '')
-    .replace(/\s+/g, ' ');
+  // Normalize text and name for fuzzy matching
+  // Remove special characters but preserve word boundaries
+  const normalizeForMatch = (str: string): string => {
+    return str
+      .replace(/private\s*limited/gi, 'pvt ltd')
+      .replace(/private\s*ltd/gi, 'pvt ltd')
+      .replace(/pvt\.?\s*limited/gi, 'pvt ltd')
+      .replace(/limited/gi, 'ltd')
+      .replace(/\./g, '')           // Remove dots
+      .replace(/-/g, ' ')           // Convert hyphens to spaces (e-Luscious → e luscious)
+      .replace(/[^\w\s]/g, '')      // Remove other special chars
+      .replace(/\s+/g, ' ')         // Normalize whitespace
+      .trim();
+  };
 
-  const normalizedName = lowerName
-    .replace(/private\s*limited/gi, 'pvt ltd')
-    .replace(/private\s*ltd/gi, 'pvt ltd')
-    .replace(/pvt\.?\s*limited/gi, 'pvt ltd')
-    .replace(/limited/gi, 'ltd')
-    .replace(/\./g, '')
-    .replace(/\s+/g, ' ');
+  const normalizedText = normalizeForMatch(lowerText);
+  const normalizedName = normalizeForMatch(lowerName);
 
   // Check normalized match
   if (normalizedText.includes(normalizedName)) {
     return true;
   }
 
-  // Check if significant parts of the name appear (for long company names)
-  const nameParts = normalizedName.split(' ').filter(part => part.length > 3);
-  if (nameParts.length > 1) {
-    const significantPartsFound = nameParts.filter(part => normalizedText.includes(part));
-    // If most significant parts are found, consider it a match
-    if (significantPartsFound.length >= Math.ceil(nameParts.length * 0.7)) {
+  // For names with hyphens like "e-Luscious", also try matching without the prefix
+  // e.g., search for "luscious" if "e-luscious" doesn't match
+  const nameWords = normalizedName.split(' ').filter(w => w.length > 0);
+
+  // Check if the main word(s) from the company name appear (excluding short prefixes)
+  const significantWords = nameWords.filter(word => word.length > 3);
+
+  if (significantWords.length > 0) {
+    // Count how many significant words are found
+    const foundWords = significantWords.filter(word => normalizedText.includes(word));
+
+    // If ALL significant words are found, it's a match
+    // This handles cases like "e-luscious nederland b.v." where we find "luscious" and "nederland"
+    if (foundWords.length === significantWords.length) {
+      return true;
+    }
+
+    // If at least 70% of significant words are found, also consider it a match
+    if (foundWords.length >= Math.ceil(significantWords.length * 0.7)) {
+      return true;
+    }
+  }
+
+  // Also try matching individual significant parts for companies with multiple words
+  // e.g., "Luscious" should match even if "e-Luscious Nederland B.V." is the full name
+  for (const word of nameWords) {
+    if (word.length > 4 && normalizedText.includes(word)) {
+      // Found a substantial part of the name
       return true;
     }
   }
