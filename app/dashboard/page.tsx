@@ -6,6 +6,7 @@ import type { ProcessedInvoice, DashboardStats } from '@/lib/types';
 import StatsCard from '@/components/StatsCard';
 import InvoiceTable from '@/components/InvoiceTable';
 import InvoiceDetail from '@/components/InvoiceDetail';
+import UploadArea from '@/components/UploadArea';
 
 interface ProgressState {
   current: number;
@@ -313,6 +314,9 @@ export default function DashboardPage() {
             )}
           </div>
         )}
+
+        {/* Upload Area */}
+        <UploadArea onUploadComplete={fetchInvoices} />
 
         {/* Stats Grid */}
         <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
