@@ -106,7 +106,7 @@ export async function POST(request: NextRequest) {
           fileName: file.name,
           extractedData: result.data,
           confidenceScore: Math.max(0, Math.min(1, result.confidence + validation.confidenceAdjustment)),
-          processingNotes: notes.join('. '),
+          processingNotes: notes.join('; '),
         });
 
         processed++;
