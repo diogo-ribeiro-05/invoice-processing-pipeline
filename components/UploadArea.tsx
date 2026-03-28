@@ -73,7 +73,13 @@ export default function UploadArea({ onUploadComplete }: UploadAreaProps) {
       }
 
       const result = await response.json();
-      setUploadProgress(`Successfully processed ${result.processed} of ${result.total} invoice(s)`);
+
+      // Build progress message
+      let message = `Processed ${result.processed} of ${result.total} invoice(s)`;
+      if (result.skipped > 0) {
+        message += ` (${result.skipped} skipped as duplicates)`;
+      }
+      setUploadProgress(message);
 
       // Refresh the invoice list
       setTimeout(() => {

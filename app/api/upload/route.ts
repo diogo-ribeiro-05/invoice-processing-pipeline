@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { extractInvoiceDataWithRetry } from '@/lib/claude';
-import { submitProcessedInvoice, validateVendor, getCompanies } from '@/lib/erp-api';
+import { submitProcessedInvoice, validateVendor, getCompanies, getProcessedInvoices } from '@/lib/erp-api';
 
 export async function POST(request: NextRequest) {
   try {
@@ -17,9 +17,20 @@ export async function POST(request: NextRequest) {
     // Get companies for validation
     const companies = await getCompanies();
 
+    // Get already processed invoices to check for duplicates
+    const existingInvoices = await getProcessedInvoices();
+    const existingFileNames = new Set(existingInvoices.items.map((inv) => inv.fileName));
+    const existingInvoiceNumbers = new Set(
+      existingInvoices.items
+        .map((inv) => (inv.extractedData as { invoiceNumber?: string })?.invoiceNumber)
+        .filter(Boolean)
+    );
+
     let processed = 0;
+    let skipped = 0;
     let failed = 0;
     const errors: string[] = [];
+    const skippedFiles: string[] = [];
 
     for (const file of files) {
       try {
@@ -27,6 +38,13 @@ export async function POST(request: NextRequest) {
         if (file.type !== 'application/pdf') {
           errors.push(`${file.name}: Not a PDF file`);
           failed++;
+          continue;
+        }
+
+        // Check for duplicate by file name
+        if (existingFileNames.has(file.name)) {
+          skippedFiles.push(`${file.name}: Already processed (duplicate file name)`);
+          skipped++;
           continue;
         }
 
@@ -40,6 +58,13 @@ export async function POST(request: NextRequest) {
         if (!result.data) {
           errors.push(`${file.name}: ${result.error || 'Extraction failed'}`);
           failed++;
+          continue;
+        }
+
+        // Check for duplicate by invoice number
+        if (result.data.invoiceNumber && existingInvoiceNumbers.has(result.data.invoiceNumber)) {
+          skippedFiles.push(`${file.name}: Already processed (duplicate invoice #${result.data.invoiceNumber})`);
+          skipped++;
           continue;
         }
 
@@ -95,8 +120,10 @@ export async function POST(request: NextRequest) {
       success: true,
       total: files.length,
       processed,
+      skipped,
       failed,
       errors: errors.length > 0 ? errors : undefined,
+      skippedFiles: skippedFiles.length > 0 ? skippedFiles : undefined,
     });
   } catch (error) {
     console.error('Upload error:', error);
