@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import pdf from 'pdf-parse';
 import type { ExtractedData } from './types';
+import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -279,6 +280,7 @@ async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName:
  * PASS 1: Full digital extraction (pdf-parse → GLM-5)
  * VALIDATION: Check if vendorName/vendorTaxId need patching
  * PASS 2: If needed, OCR → GLM-5 (vendor only) → patch original JSON
+ * POST-PROCESSING: Validate vendor name against ERP using Tax ID
  * RETURN: Merged result with perfect financial data + patched vendor info
  */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
@@ -346,47 +348,62 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     // ========================================
     // VALIDATION: Check if OCR patch needed
     // ========================================
-    if (!needsOcrPatch(extractedData)) {
-      console.log('Digital extraction complete - no OCR patch needed');
-      return {
-        data: extractedData,
-        confidence: calculateConfidence(extractedData),
-        rawResponse,
-      };
+    if (needsOcrPatch(extractedData)) {
+      // ========================================
+      // PASS 2: Targeted OCR Patch
+      // ========================================
+      console.log('PASS 2: OCR patch needed - extracting from images...');
+
+      const ocrText = await extractWithOcrSpace(pdfBuffer);
+
+      if (ocrText && ocrText.trim().length > 0) {
+        // Extract ONLY vendorName and vendorTaxId from OCR text
+        const vendorPatch = await extractVendorPatchFromOcr(ocrText);
+
+        if (vendorPatch) {
+          // Patch the original digital data with OCR vendor info
+          if (vendorPatch.vendorName) {
+            console.log('Patching vendorName:', extractedData.vendorName, '→', vendorPatch.vendorName);
+            extractedData.vendorName = vendorPatch.vendorName;
+          }
+          if (vendorPatch.vendorTaxId) {
+            console.log('Patching vendorTaxId:', extractedData.vendorTaxId, '→', vendorPatch.vendorTaxId);
+            extractedData.vendorTaxId = vendorPatch.vendorTaxId;
+          }
+        }
+      } else {
+        console.log('OCR extraction failed or empty - keeping digital result');
+      }
+
+      console.log('PASS 2 complete. Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
     }
 
     // ========================================
-    // PASS 2: Targeted OCR Patch
+    // POST-PROCESSING: ERP Vendor Name Validation
     // ========================================
-    console.log('PASS 2: OCR patch needed - extracting from images...');
+    // Use Tax ID as source of truth to validate/correct vendor name
+    if (extractedData.vendorTaxId) {
+      console.log('POST-PROCESSING: Validating vendor name against ERP...');
 
-    const ocrText = await extractWithOcrSpace(pdfBuffer);
+      const erpCompany = await findCompanyByTaxId(extractedData.vendorTaxId);
 
-    if (!ocrText || ocrText.trim().length === 0) {
-      console.log('OCR extraction failed or empty - keeping digital result');
-      return {
-        data: extractedData,
-        confidence: calculateConfidence(extractedData),
-        rawResponse,
-      };
-    }
+      if (erpCompany) {
+        console.log('ERP found company by Tax ID:', erpCompany.name);
 
-    // Extract ONLY vendorName and vendorTaxId from OCR text
-    const vendorPatch = await extractVendorPatchFromOcr(ocrText);
-
-    if (vendorPatch) {
-      // Patch the original digital data with OCR vendor info
-      if (vendorPatch.vendorName) {
-        console.log('Patching vendorName:', extractedData.vendorName, '→', vendorPatch.vendorName);
-        extractedData.vendorName = vendorPatch.vendorName;
-      }
-      if (vendorPatch.vendorTaxId) {
-        console.log('Patching vendorTaxId:', extractedData.vendorTaxId, '→', vendorPatch.vendorTaxId);
-        extractedData.vendorTaxId = vendorPatch.vendorTaxId;
+        // Check if the official ERP name appears in the PDF text
+        if (isCompanyNameInText(erpCompany.name, pdfText)) {
+          console.log('Official ERP name found in PDF - updating vendorName');
+          console.log('Replacing:', extractedData.vendorName, '→', erpCompany.name);
+          extractedData.vendorName = erpCompany.name;
+        } else {
+          console.log('Official ERP name NOT found in PDF - keeping extracted name');
+        }
+      } else {
+        console.log('Tax ID not found in ERP - keeping extracted vendor name');
       }
     }
 
-    console.log('PASS 2 complete. Final Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
+    console.log('Final Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
 
     return {
       data: extractedData,

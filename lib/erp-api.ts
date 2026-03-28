@@ -54,6 +54,80 @@ function normalizeTaxId(taxId: string): string {
   return taxId.replace(/[\s.\-]/g, '').toUpperCase();
 }
 
+/**
+ * Find a company in ERP by Tax ID
+ * Returns the company with official name if found, null otherwise
+ */
+export async function findCompanyByTaxId(taxId: string): Promise<Company | null> {
+  if (!taxId || taxId.trim() === '') {
+    return null;
+  }
+
+  try {
+    const companies = await getCompanies();
+    const normalizedTaxId = normalizeTaxId(taxId);
+
+    return companies.find(
+      (company) => normalizeTaxId(company.taxId) === normalizedTaxId
+    ) || null;
+  } catch (error) {
+    console.error('Error looking up company by Tax ID:', error);
+    return null;
+  }
+}
+
+/**
+ * Fuzzy search for a company name in PDF text
+ * Handles variations like "Pvt" vs "Private", case differences, etc.
+ */
+export function isCompanyNameInText(companyName: string, pdfText: string): boolean {
+  if (!companyName || !pdfText) {
+    return false;
+  }
+
+  const lowerText = pdfText.toLowerCase();
+  const lowerName = companyName.toLowerCase();
+
+  // Direct match
+  if (lowerText.includes(lowerName)) {
+    return true;
+  }
+
+  // Normalize common variations for fuzzy matching
+  const normalizedText = lowerText
+    .replace(/private\s*limited/gi, 'pvt ltd')
+    .replace(/private\s*ltd/gi, 'pvt ltd')
+    .replace(/pvt\.?\s*limited/gi, 'pvt ltd')
+    .replace(/limited/gi, 'ltd')
+    .replace(/\./g, '')
+    .replace(/\s+/g, ' ');
+
+  const normalizedName = lowerName
+    .replace(/private\s*limited/gi, 'pvt ltd')
+    .replace(/private\s*ltd/gi, 'pvt ltd')
+    .replace(/pvt\.?\s*limited/gi, 'pvt ltd')
+    .replace(/limited/gi, 'ltd')
+    .replace(/\./g, '')
+    .replace(/\s+/g, ' ');
+
+  // Check normalized match
+  if (normalizedText.includes(normalizedName)) {
+    return true;
+  }
+
+  // Check if significant parts of the name appear (for long company names)
+  const nameParts = normalizedName.split(' ').filter(part => part.length > 3);
+  if (nameParts.length > 1) {
+    const significantPartsFound = nameParts.filter(part => normalizedText.includes(part));
+    // If most significant parts are found, consider it a match
+    if (significantPartsFound.length >= Math.ceil(nameParts.length * 0.7)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 // Check if there's a math error in the invoice amounts
 export function checkMathError(
   subtotal: number | null | undefined,
