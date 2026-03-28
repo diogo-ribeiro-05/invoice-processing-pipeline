@@ -203,7 +203,7 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
 
     // Append as a file rather than a base64 string
     formData.append('file', blob, 'invoice.pdf');
-    formData.append('apikey', 'helloworld');
+    formData.append('apikey', process.env.OCR_SPACE_API_KEY || 'helloworld');
     formData.append('OCREngine', '2'); // Engine 2 is better for PDFs
     // Note: Removed 'language: dut+eng' as forcing multiple languages can cause timeouts on the free tier.
     // Engine 2 auto-detects characters well enough for Tax IDs.
