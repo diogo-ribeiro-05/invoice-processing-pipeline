@@ -76,11 +76,8 @@ export async function POST() {
           message: `Found ${filesToProcess.length} invoices to process...`,
         });
 
-        // Process files in parallel with concurrency limit
-        const concurrency = 3;
-        let index = 0;
-
-        const processFile = async (fileName: string): Promise<void> => {
+        // Process files sequentially to ensure ALL files are processed
+        for (const fileName of filesToProcess) {
           current++;
           sendProgress({
             type: 'progress',
@@ -106,7 +103,7 @@ export async function POST() {
                 status: 'error',
                 message: `Failed to extract data from ${fileName}`,
               });
-              return;
+              continue;
             }
 
             const extractedData = extractionResult.data;
@@ -157,22 +154,7 @@ export async function POST() {
               message: `Error processing ${fileName}: ${error instanceof Error ? error.message : 'Unknown'}`,
             });
           }
-        };
-
-        // Process with concurrency
-        const processNext = async (): Promise<void> => {
-          while (index < filesToProcess.length) {
-            const currentIndex = index++;
-            await processFile(filesToProcess[currentIndex]);
-          }
-        };
-
-        // Start concurrent workers
-        const workers = Array(Math.min(concurrency, filesToProcess.length))
-          .fill(null)
-          .map(() => processNext());
-
-        await Promise.all(workers);
+        }
 
         // Send completion
         sendProgress({
