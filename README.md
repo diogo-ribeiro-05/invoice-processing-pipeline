@@ -6,6 +6,20 @@ An intelligent invoice processing system built for Portline Logistics. This appl
 
 This system processes PDF invoices in multiple languages (English, Dutch, French, German) and currencies (USD, EUR, INR), using a **Primary/Secondary AI fallback architecture** to ensure reliability even when individual AI providers experience outages or rate limits.
 
+> **Alternative: Non-AI Version Available**
+>
+> Check out the [`feature/no-ai-extraction`](https://github.com/diogo-ribeiro-05/invoice-processing-pipeline/tree/feature/no-ai-extraction) branch for a regex-based approach that doesn't require AI APIs. This is useful when AI services are unavailable or cost is a concern.
+
+## ⚠️ Deployment Notice
+
+**If the Anthropic/Z.AI API key is deactivated, the deployed version will likely fail.** Even though the system has a fallback to Google Gemini:
+
+- **Gemini Free Tier Limits**: The free tier has very restrictive rate limits (150 requests/day) and reaches capacity quickly
+- **Production Workloads**: Gemini free tier is insufficient for processing multiple invoices in batch
+- **Both Providers Down**: If Z.AI is unavailable and Gemini hits rate limits, extraction will fail
+
+For environments without reliable AI API access, consider using the [`feature/no-ai-extraction`](https://github.com/diogo-ribeiro-05/invoice-processing-pipeline/tree/feature/no-ai-extraction) branch which uses regex-based extraction without any AI dependencies.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -254,7 +268,7 @@ Handles invoices in:
 
 ### External ERP API
 
-- **Base URL**: `https://backend-production-4c89.up.railway.app/api/erp`
+- **Base URL**: Contact admin for API endpoint
 - **Authentication**: `X-ERP-API-Key` header
 
 ## Extracted Data Schema
@@ -288,7 +302,7 @@ interface LineItem {
 # PRIMARY AI: Z.AI (Anthropic-compatible)
 # ===========================================
 ANTHROPIC_API_KEY=your-zai-api-key
-ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+ANTHROPIC_BASE_URL=<contact-admin-for-url>
 ANTHROPIC_MODEL=glm-5
 
 # ===========================================
@@ -301,7 +315,7 @@ GEMINI_MODEL=gemini-2.5-flash
 # ERP API Configuration
 # ===========================================
 ERP_API_KEY=your-erp-api-key
-ERP_API_BASE_URL=https://backend-production-4c89.up.railway.app/api/erp
+ERP_API_BASE_URL=<contact-admin-for-url>
 
 # ===========================================
 # Authentication (Optional)
