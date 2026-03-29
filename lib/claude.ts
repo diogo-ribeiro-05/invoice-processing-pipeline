@@ -1,16 +1,26 @@
+import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenerativeAI, HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
 import pdf from 'pdf-parse';
 import type { ExtractedData } from './types';
 import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
+// ============================================
+// PRIMARY: Z.AI (Anthropic SDK with glm-5)
+// ============================================
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  baseURL: process.env.ANTHROPIC_BASE_URL || 'https://api.z.ai/api/anthropic',
+});
+const PRIMARY_MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
+
+// ============================================
+// SECONDARY: Google Gemini (Fallback)
+// ============================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const FALLBACK_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// Rate limit delay between API calls (6 seconds to stay under 10 req/min free tier)
-const RATE_LIMIT_DELAY_MS = parseInt(process.env.GEMINI_RATE_LIMIT_MS || '6000', 10);
-
-// Safety settings: Disable all content filtering to prevent false-positive blocks on invoice data
-const SAFETY_SETTINGS = [
+// Safety settings for Gemini: Disable all content filtering
+const GEMINI_SAFETY_SETTINGS = [
   { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
   { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -19,7 +29,7 @@ const SAFETY_SETTINGS = [
 
 /**
  * Main extraction prompt for digital text (Pass 1)
- * Extracts all invoice fields from digital PDF text
+ * Used by BOTH Z.AI and Gemini - ensures consistent output
  */
 const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
 
@@ -78,7 +88,7 @@ INVOICE TEXT:
 
 /**
  * Targeted prompt for OCR patch extraction (Pass 2)
- * Extracts ONLY vendorName and vendorTaxId from OCR text
+ * Used by BOTH Z.AI and Gemini
  */
 const OCR_PATCH_PROMPT = `You are extracting vendor information from OCR text scanned from an invoice image.
 
@@ -103,69 +113,103 @@ RETURN ONLY raw JSON (no markdown, no code blocks, no explanation):
 OCR TEXT:
 `;
 
-/**
- * Call Gemini API to extract structured data
- * Includes JSON mime type enforcement and disabled safety filters
- */
-async function callGemini(prompt: string): Promise<string> {
+// ============================================
+// PRIMARY EXTRACTION: Z.AI (Anthropic SDK)
+// ============================================
+async function extractWithZAI(prompt: string): Promise<string> {
   const startTime = Date.now();
-  console.log(`[Gemini] Calling model: ${MODEL}`);
+  console.log(`[Z.AI Primary] Calling model: ${PRIMARY_MODEL}`);
 
-  try {
-    const model = genAI.getGenerativeModel({ model: MODEL });
-
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 4096,
-        responseMimeType: 'application/json', // Force JSON output
+  const message = await anthropic.messages.create({
+    model: PRIMARY_MODEL,
+    max_tokens: 4096,
+    messages: [
+      {
+        role: 'user',
+        content: prompt,
       },
-      safetySettings: SAFETY_SETTINGS, // Disable content filtering
-    });
+    ],
+  });
 
-    const response = result.response;
-    const text = response.text();
-    const duration = Date.now() - startTime;
+  const textBlock = message.content.find((block) => block.type === 'text');
+  if (!textBlock || textBlock.type !== 'text') {
+    throw new Error('No text response from Z.AI');
+  }
 
-    console.log(`[Gemini] Response received in ${duration}ms, length: ${text.length}`);
+  const duration = Date.now() - startTime;
+  console.log(`[Z.AI Primary] Response received in ${duration}ms, length: ${textBlock.text.length}`);
 
-    // Log if prompt feedback was blocked
-    if (response.promptFeedback?.blockReason) {
-      console.warn(`[Gemini] Prompt blocked: ${response.promptFeedback.blockReason}`);
+  return textBlock.text;
+}
+
+// ============================================
+// SECONDARY EXTRACTION: Google Gemini (Fallback)
+// ============================================
+async function extractWithGemini(prompt: string): Promise<string> {
+  const startTime = Date.now();
+  console.log(`[Gemini Fallback] Calling model: ${FALLBACK_MODEL}`);
+
+  const model = genAI.getGenerativeModel({ model: FALLBACK_MODEL });
+
+  const result = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 4096,
+      responseMimeType: 'application/json',
+    },
+    safetySettings: GEMINI_SAFETY_SETTINGS,
+  });
+
+  const response = result.response;
+  const text = response.text();
+  const duration = Date.now() - startTime;
+
+  console.log(`[Gemini Fallback] Response received in ${duration}ms, length: ${text.length}`);
+
+  if (response.promptFeedback?.blockReason) {
+    console.warn(`[Gemini Fallback] Prompt blocked: ${response.promptFeedback.blockReason}`);
+  }
+
+  return text;
+}
+
+// ============================================
+// FALLBACK WRAPPER: Try Primary, Fall back to Secondary
+// ============================================
+async function extractWithFallback(prompt: string): Promise<string> {
+  // Try Z.AI Primary first
+  try {
+    return await extractWithZAI(prompt);
+  } catch (primaryError) {
+    console.warn('[Extraction] Z.AI primary extraction failed. Falling back to Gemini...');
+    console.warn(`[Extraction] Primary error: ${primaryError instanceof Error ? primaryError.message : primaryError}`);
+
+    // Fall back to Gemini
+    try {
+      return await extractWithGemini(prompt);
+    } catch (fallbackError) {
+      console.error('[Extraction] Gemini fallback also failed!');
+      console.error(`[Extraction] Fallback error: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`);
+      throw primaryError; // Throw the original error
     }
-
-    return text;
-  } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`[Gemini] API error after ${duration}ms:`, error);
-
-    // Detailed error logging for debugging
-    if (error instanceof Error) {
-      console.error(`[Gemini] Error message: ${error.message}`);
-      console.error(`[Gemini] Error stack: ${error.stack?.split('\n').slice(0, 3).join('\n')}`);
-    }
-
-    throw error;
   }
 }
 
-/**
- * Robust JSON parser for Gemini responses
- * Handles multiple markdown formats and edge cases
- */
+// ============================================
+// JSON PARSING: Robust handling of various formats
+// ============================================
 function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
   try {
     let jsonStr = rawResponse.trim();
 
     // Robust markdown stripping - handle multiple variations
     jsonStr = jsonStr
-      .replace(/```json\s*/gi, '')  // Remove ```json (case-insensitive)
-      .replace(/```\s*/g, '')       // Remove ``` with any whitespace
-      .replace(/^[^{]*/, '')        // Remove any text before the first {
-      .replace(/[^}]*$/, '');       // Remove any text after the last }
+      .replace(/```json\s*/gi, '')
+      .replace(/```\s*/g, '')
+      .replace(/^[^{]*/, '')
+      .replace(/[^}]*$/, '');
 
-    // If we stripped too much, try original approach
     if (!jsonStr.startsWith('{')) {
       jsonStr = rawResponse.trim();
       if (jsonStr.startsWith('```json')) {
@@ -212,20 +256,15 @@ function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
   }
 }
 
-/**
- * Parse the targeted OCR patch response (vendorName + vendorTaxId only)
- */
 function parseOcrPatchResponse(rawResponse: string): { vendorName: string | null; vendorTaxId: string | null } | null {
   try {
     let jsonStr = rawResponse.trim();
 
-    // Robust markdown stripping
     jsonStr = jsonStr
       .replace(/```json\s*/gi, '')
       .replace(/```\s*/g, '')
       .trim();
 
-    // Try to find JSON object
     const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       jsonStr = jsonMatch[0];
@@ -260,12 +299,10 @@ function calculateConfidence(data: ExtractedData | null): number {
 
 /**
  * Check if digital extraction needs OCR patching
- * Returns true if vendorName is missing/placeholder or vendorTaxId is missing
  */
 function needsOcrPatch(data: ExtractedData | null): boolean {
   if (!data) return true;
 
-  // Check if vendor name is missing or looks like a placeholder
   const vendorName = data.vendorName?.toLowerCase().trim() || '';
   const placeholderPatterns = [
     'your',
@@ -281,7 +318,6 @@ function needsOcrPatch(data: ExtractedData | null): boolean {
                         vendorName.length < 2 ||
                         placeholderPatterns.some(p => vendorName.includes(p));
 
-  // Check if tax ID is missing
   const missingTaxId = !data.vendorTaxId || data.vendorTaxId.trim() === '';
 
   return isPlaceholder || missingTaxId;
@@ -289,25 +325,18 @@ function needsOcrPatch(data: ExtractedData | null): boolean {
 
 /**
  * Extract text from PDF using OCR.space API
- * Uses modern Node.js Blob for true binary file upload
- * Returns empty string on failure to prevent pipeline crashes
  */
 async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
   try {
     console.log('Starting OCR.space extraction...');
 
-    // Use modern Node.js Blob for true binary file upload
-    // Convert Buffer to Uint8Array for Blob compatibility
     const uint8Array = new Uint8Array(pdfBuffer);
     const blob = new Blob([uint8Array], { type: 'application/pdf' });
     const formData = new FormData();
 
-    // Append as a file rather than a base64 string
     formData.append('file', blob, 'invoice.pdf');
     formData.append('apikey', process.env.OCR_SPACE_API_KEY || 'helloworld');
-    formData.append('OCREngine', '2'); // Engine 2 is better for PDFs
-    // Note: Removed 'language: dut+eng' as forcing multiple languages can cause timeouts on the free tier.
-    // Engine 2 auto-detects characters well enough for Tax IDs.
+    formData.append('OCREngine', '2');
 
     const response = await fetch('https://api.ocr.space/parse/image', {
       method: 'POST',
@@ -340,14 +369,13 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
 }
 
 /**
- * Extract vendor info from OCR text using targeted prompt
- * Returns only vendorName and vendorTaxId
+ * Extract vendor info from OCR text using fallback architecture
  */
 async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName: string | null; vendorTaxId: string | null } | null> {
   try {
     console.log('Extracting vendor patch from OCR text...');
 
-    const response = await callGemini(OCR_PATCH_PROMPT + '\n\n' + ocrText);
+    const response = await extractWithFallback(OCR_PATCH_PROMPT + '\n\n' + ocrText);
 
     const patch = parseOcrPatchResponse(response);
     if (patch) {
@@ -361,11 +389,11 @@ async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName:
 }
 
 /**
- * Extract invoice data using Targeted Field Patching architecture
+ * Extract invoice data using Primary/Secondary fallback architecture
  *
- * PASS 1: Full digital extraction (pdf-parse → Gemini)
+ * PASS 1: Full digital extraction (pdf-parse → Z.AI → fallback to Gemini)
  * VALIDATION: Check if vendorName/vendorTaxId need patching
- * PASS 2: If needed, OCR → Gemini (vendor only) → patch original JSON
+ * PASS 2: If needed, OCR → Z.AI → fallback to Gemini → patch original JSON
  * POST-PROCESSING: Validate vendor name against ERP using Tax ID
  * RETURN: Merged result with perfect financial data + patched vendor info
  */
@@ -395,9 +423,9 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
 
     console.log('Digital text length:', pdfText.length);
 
-    // Send digital text to Gemini with full extraction prompt
+    // Use fallback architecture: Try Z.AI first, fall back to Gemini
     const fullPrompt = EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY raw JSON with no markdown formatting or code blocks.';
-    const rawResponse = await callGemini(fullPrompt);
+    const rawResponse = await extractWithFallback(fullPrompt);
 
     let extractedData = parseJsonFromResponse(rawResponse);
 
@@ -427,11 +455,9 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       ocrText = await extractWithOcrSpace(pdfBuffer);
 
       if (ocrText && ocrText.trim().length > 0) {
-        // Extract ONLY vendorName and vendorTaxId from OCR text
         const vendorPatch = await extractVendorPatchFromOcr(ocrText);
 
         if (vendorPatch) {
-          // Patch the original digital data with OCR vendor info
           if (vendorPatch.vendorName) {
             console.log('Patching vendorName:', extractedData.vendorName, '→', vendorPatch.vendorName);
             extractedData.vendorName = vendorPatch.vendorName;
@@ -451,7 +477,6 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
     // ========================================
     // POST-PROCESSING: ERP Vendor Name Validation
     // ========================================
-    // Use Tax ID as source of truth to validate/correct vendor name
     if (extractedData.vendorTaxId) {
       console.log('POST-PROCESSING: Validating vendor name against ERP...');
 
@@ -460,12 +485,9 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       if (erpCompany) {
         console.log('ERP found company by Tax ID:', erpCompany.name);
 
-        // Combine digital text AND OCR text for comprehensive search
-        // The official company name might be in either source
         const combinedSearchText = pdfText + '\n' + ocrText;
         console.log('Searching in combined text (digital + OCR), total length:', combinedSearchText.length);
 
-        // Check if the official ERP name appears in the combined text
         if (isCompanyNameInText(erpCompany.name, combinedSearchText)) {
           console.log('Official ERP name found in text - updating vendorName');
           console.log('Replacing:', extractedData.vendorName, '→', erpCompany.name);
@@ -529,16 +551,3 @@ export async function extractInvoiceDataWithRetry(
     error: lastError || 'Failed after retries',
   };
 }
-
-/**
- * Rate limit delay for batch processing
- * Call this between invoice extractions to stay under Gemini free tier limits
- * Default: 6 seconds (10 requests per minute = 1 request per 6 seconds)
- */
-export async function rateLimitDelay(): Promise<void> {
-  console.log(`[Rate Limit] Waiting ${RATE_LIMIT_DELAY_MS}ms before next extraction...`);
-  await new Promise((resolve) => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
-}
-
-// Export the delay value for logging
-export const GEMINI_RATE_LIMIT_MS = RATE_LIMIT_DELAY_MS;
