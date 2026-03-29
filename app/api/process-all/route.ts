@@ -1,10 +1,13 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import { extractInvoiceDataWithRetry } from '@/lib/claude';
+import { extractInvoiceDataWithRetry, rateLimitDelay, GEMINI_RATE_LIMIT_MS } from '@/lib/claude';
 import { getCompanies, validateVendor, submitProcessedInvoice, getProcessedInvoices } from '@/lib/erp-api';
 
 export const dynamic = 'force-dynamic';
+
+// Log rate limit config on startup
+console.log(`[Process All] Rate limit delay: ${GEMINI_RATE_LIMIT_MS}ms between invoices`);
 
 interface ProgressUpdate {
   type: 'progress' | 'complete' | 'error';
@@ -79,6 +82,21 @@ export async function POST() {
         // Process files sequentially to ensure ALL files are processed
         for (const fileName of filesToProcess) {
           current++;
+
+          // Rate limiting: wait between invoices to avoid Gemini API limits
+          // Skip delay on first invoice (no previous API call to rate limit against)
+          if (current > 1) {
+            sendProgress({
+              type: 'progress',
+              current,
+              total: files.length,
+              fileName,
+              status: 'processing',
+              message: `Rate limiting... waiting ${GEMINI_RATE_LIMIT_MS / 1000}s before processing ${fileName}...`,
+            });
+            await rateLimitDelay();
+          }
+
           sendProgress({
             type: 'progress',
             current,

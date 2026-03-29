@@ -1,10 +1,21 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
 import pdf from 'pdf-parse';
 import type { ExtractedData } from './types';
 import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+// Rate limit delay between API calls (6 seconds to stay under 10 req/min free tier)
+const RATE_LIMIT_DELAY_MS = parseInt(process.env.GEMINI_RATE_LIMIT_MS || '6000', 10);
+
+// Safety settings: Disable all content filtering to prevent false-positive blocks on invoice data
+const SAFETY_SETTINGS = [
+  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+];
 
 /**
  * Main extraction prompt for digital text (Pass 1)
@@ -94,8 +105,12 @@ OCR TEXT:
 
 /**
  * Call Gemini API to extract structured data
+ * Includes JSON mime type enforcement and disabled safety filters
  */
 async function callGemini(prompt: string): Promise<string> {
+  const startTime = Date.now();
+  console.log(`[Gemini] Calling model: ${MODEL}`);
+
   try {
     const model = genAI.getGenerativeModel({ model: MODEL });
 
@@ -104,36 +119,95 @@ async function callGemini(prompt: string): Promise<string> {
       generationConfig: {
         temperature: 0.1,
         maxOutputTokens: 4096,
+        responseMimeType: 'application/json', // Force JSON output
       },
+      safetySettings: SAFETY_SETTINGS, // Disable content filtering
     });
 
     const response = result.response;
-    return response.text();
+    const text = response.text();
+    const duration = Date.now() - startTime;
+
+    console.log(`[Gemini] Response received in ${duration}ms, length: ${text.length}`);
+
+    // Log if prompt feedback was blocked
+    if (response.promptFeedback?.blockReason) {
+      console.warn(`[Gemini] Prompt blocked: ${response.promptFeedback.blockReason}`);
+    }
+
+    return text;
   } catch (error) {
-    console.error('Gemini API error:', error);
+    const duration = Date.now() - startTime;
+    console.error(`[Gemini] API error after ${duration}ms:`, error);
+
+    // Detailed error logging for debugging
+    if (error instanceof Error) {
+      console.error(`[Gemini] Error message: ${error.message}`);
+      console.error(`[Gemini] Error stack: ${error.stack?.split('\n').slice(0, 3).join('\n')}`);
+    }
+
     throw error;
   }
 }
 
 /**
- * Parse JSON from Gemini response, handling markdown code blocks
+ * Robust JSON parser for Gemini responses
+ * Handles multiple markdown formats and edge cases
  */
 function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
   try {
     let jsonStr = rawResponse.trim();
-    // Handle markdown code blocks
-    if (jsonStr.startsWith('```json')) {
-      jsonStr = jsonStr.slice(7);
-    } else if (jsonStr.startsWith('```')) {
-      jsonStr = jsonStr.slice(3);
+
+    // Robust markdown stripping - handle multiple variations
+    jsonStr = jsonStr
+      .replace(/```json\s*/gi, '')  // Remove ```json (case-insensitive)
+      .replace(/```\s*/g, '')       // Remove ``` with any whitespace
+      .replace(/^[^{]*/, '')        // Remove any text before the first {
+      .replace(/[^}]*$/, '');       // Remove any text after the last }
+
+    // If we stripped too much, try original approach
+    if (!jsonStr.startsWith('{')) {
+      jsonStr = rawResponse.trim();
+      if (jsonStr.startsWith('```json')) {
+        jsonStr = jsonStr.slice(7);
+      } else if (jsonStr.startsWith('```')) {
+        jsonStr = jsonStr.slice(3);
+      }
+      if (jsonStr.endsWith('```')) {
+        jsonStr = jsonStr.slice(0, -3);
+      }
     }
-    if (jsonStr.endsWith('```')) {
-      jsonStr = jsonStr.slice(0, -3);
-    }
+
     jsonStr = jsonStr.trim();
-    return JSON.parse(jsonStr) as ExtractedData;
-  } catch {
-    console.error('Failed to parse JSON from response:', rawResponse.substring(0, 200));
+
+    // Try to find JSON object in the string
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonStr = jsonMatch[0];
+    }
+
+    const parsed = JSON.parse(jsonStr) as ExtractedData;
+    console.log('[JSON Parser] Successfully parsed response');
+    return parsed;
+  } catch (parseError) {
+    console.error('[JSON Parser] Failed to parse response');
+    console.error('[JSON Parser] First 500 chars:', rawResponse.substring(0, 500));
+    console.error('[JSON Parser] Parse error:', parseError instanceof Error ? parseError.message : parseError);
+
+    // Try one more approach: extract everything between first { and last }
+    try {
+      const firstBrace = rawResponse.indexOf('{');
+      const lastBrace = rawResponse.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        const extracted = rawResponse.substring(firstBrace, lastBrace + 1);
+        const parsed = JSON.parse(extracted) as ExtractedData;
+        console.log('[JSON Parser] Recovered using brace extraction');
+        return parsed;
+      }
+    } catch {
+      console.error('[JSON Parser] Brace extraction also failed');
+    }
+
     return null;
   }
 }
@@ -144,22 +218,27 @@ function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
 function parseOcrPatchResponse(rawResponse: string): { vendorName: string | null; vendorTaxId: string | null } | null {
   try {
     let jsonStr = rawResponse.trim();
-    if (jsonStr.startsWith('```json')) {
-      jsonStr = jsonStr.slice(7);
-    } else if (jsonStr.startsWith('```')) {
-      jsonStr = jsonStr.slice(3);
+
+    // Robust markdown stripping
+    jsonStr = jsonStr
+      .replace(/```json\s*/gi, '')
+      .replace(/```\s*/g, '')
+      .trim();
+
+    // Try to find JSON object
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonStr = jsonMatch[0];
     }
-    if (jsonStr.endsWith('```')) {
-      jsonStr = jsonStr.slice(0, -3);
-    }
-    jsonStr = jsonStr.trim();
+
     const parsed = JSON.parse(jsonStr);
     return {
       vendorName: parsed.vendorName || null,
       vendorTaxId: parsed.vendorTaxId || null,
     };
-  } catch {
-    console.error('Failed to parse OCR patch response:', rawResponse.substring(0, 200));
+  } catch (parseError) {
+    console.error('[JSON Parser] OCR patch parse failed:', parseError instanceof Error ? parseError.message : parseError);
+    console.error('[JSON Parser] Raw response:', rawResponse.substring(0, 300));
     return null;
   }
 }
@@ -450,3 +529,16 @@ export async function extractInvoiceDataWithRetry(
     error: lastError || 'Failed after retries',
   };
 }
+
+/**
+ * Rate limit delay for batch processing
+ * Call this between invoice extractions to stay under Gemini free tier limits
+ * Default: 6 seconds (10 requests per minute = 1 request per 6 seconds)
+ */
+export async function rateLimitDelay(): Promise<void> {
+  console.log(`[Rate Limit] Waiting ${RATE_LIMIT_DELAY_MS}ms before next extraction...`);
+  await new Promise((resolve) => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+}
+
+// Export the delay value for logging
+export const GEMINI_RATE_LIMIT_MS = RATE_LIMIT_DELAY_MS;

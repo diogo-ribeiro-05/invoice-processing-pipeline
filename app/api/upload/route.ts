@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { extractInvoiceDataWithRetry } from '@/lib/claude';
+import { extractInvoiceDataWithRetry, rateLimitDelay, GEMINI_RATE_LIMIT_MS } from '@/lib/claude';
 import { submitProcessedInvoice, validateVendor, getCompanies, getProcessedInvoices } from '@/lib/erp-api';
 
 // Helper to send SSE messages
@@ -46,6 +46,16 @@ export async function POST(request: NextRequest) {
           // Process files sequentially with progress updates
           for (let i = 0; i < files.length; i++) {
             const file = files[i];
+
+            // Rate limiting: wait between invoices to avoid Gemini API limits
+            // Skip delay on first file (no previous API call to rate limit against)
+            if (i > 0) {
+              sendMessage(controller, {
+                type: 'status',
+                message: `Rate limiting... waiting ${GEMINI_RATE_LIMIT_MS / 1000}s...`,
+              });
+              await rateLimitDelay();
+            }
 
             // Send progress update
             sendMessage(controller, {
