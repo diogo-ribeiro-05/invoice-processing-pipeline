@@ -4,7 +4,7 @@ import type { ExtractedData } from './types';
 import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
 /**
  * Main extraction prompt for digital text (Pass 1)
