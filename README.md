@@ -220,15 +220,101 @@ invoice-processing-pipeline/
 
 Both providers use the **exact same prompt** to ensure consistent JSON output.
 
-### 3. Vendor Validation
+### 3. Invoice Validation & Status Assignment
 
-The system validates vendors against ERP records:
+The system performs multi-layer validation to assign each invoice a status of **Matched** or **Flagged**:
 
-| Status | Description | Confidence |
-|--------|-------------|------------|
-| **Matched** | Both vendor name AND tax ID match ERP records | 100% |
-| **Flagged** | Vendor matched but tax ID missing/mismatched | 50-85% |
-| **Unknown** | Vendor not found in ERP company records | 50% |
+#### Validation Process
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      VALIDATION PIPELINE                             │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+              ┌─────────────────────────────────────┐
+              │   1. VENDOR MATCHING                │
+              │   Search ERP by Tax ID              │
+              │   Match company name against text   │
+              └─────────────────┬───────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────────┐
+              │   2. TAX ID VALIDATION              │
+              │   Check if vendorTaxId exists       │
+              │   Compare with ERP records          │
+              └─────────────────┬───────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────────┐
+              │   3. MATH VERIFICATION              │
+              │   Check: Subtotal + Tax ≈ Total     │
+              │   Tolerance: ±0.50                  │
+              └─────────────────┬───────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────────┐
+              │   STATUS ASSIGNMENT                 │
+              │   Matched vs Flagged                │
+              └─────────────────────────────────────┘
+```
+
+#### Status Assignment Rules
+
+| Status | Conditions Required | Confidence |
+|--------|---------------------|------------|
+| **Matched** | ✓ Vendor found in ERP **AND** ✓ Tax ID matches **AND** ✓ No math error | 100% |
+| **Flagged** | Any validation fails (vendor not found, tax ID mismatch, or math error) | 50-85% |
+
+#### Math Verification Details
+
+The system verifies invoice calculations to detect extraction errors or fraudulent invoices:
+
+```
+Formula: Subtotal + Tax Amount = Total Amount
+Tolerance: ±0.50 (to handle rounding differences)
+
+Example PASS:
+  Subtotal: 593.36 EUR
+  Tax (21%): 124.61 EUR
+  Calculated: 717.97 EUR
+  Invoice Total: 717.97 EUR
+  → Difference: 0.00 ✓ No error
+
+Example FAIL (Flagged):
+  Subtotal: 100.00 EUR
+  Tax: 21.00 EUR
+  Calculated: 121.00 EUR
+  Invoice Total: 120.00 EUR
+  → Difference: 1.00 ✗ Math error detected
+  → Status: FLAGGED (even if vendor matches!)
+```
+
+#### Confidence Score Calculation
+
+| Scenario | Base | Adjustments |
+|----------|------|-------------|
+| All validations pass | 100% | — |
+| Vendor matched, Tax ID missing | 85% | -15% |
+| Vendor matched, Tax ID mismatch | 75% | -25% |
+| Vendor not in ERP | 50% | -50% |
+| Math error detected | — | Additional -10% |
+
+#### Validation Notes
+
+Each processed invoice includes a `validationNotes` array explaining the status:
+
+```json
+{
+  "status": "flagged",
+  "confidence": 0.75,
+  "mathError": true,
+  "validationNotes": [
+    "Vendor 'Coolblue B.V.' found in ERP via tax ID NL810433941B01",
+    "Math error detected: Subtotal (593.36) + Tax (124.61) = 717.97, but Total shows 700.00"
+  ]
+}
+```
 
 ### 4. Multi-Language Support
 
