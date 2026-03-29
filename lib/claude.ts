@@ -1,326 +1,635 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { GoogleGenerativeAI, HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
 import pdf from 'pdf-parse';
-import type { ExtractedData } from './types';
+import type { ExtractedData, LineItem } from './types';
 import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
-// ============================================
-// PRIMARY: Z.AI (Anthropic SDK with glm-5)
-// ============================================
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL || 'https://api.z.ai/api/anthropic',
-});
-const PRIMARY_MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
+/**
+ * Invoice Parser - No AI Required
+ *
+ * This module extracts structured data from invoice PDFs using regex patterns
+ * and rule-based parsing. Supports multiple languages (EN, NL, DE, FR) and
+ * currencies (EUR, USD, INR, etc.)
+ */
 
 // ============================================
-// SECONDARY: Google Gemini (Fallback)
+// HELPER FUNCTIONS
 // ============================================
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const FALLBACK_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-
-// Safety settings for Gemini: Disable all content filtering
-const GEMINI_SAFETY_SETTINGS = [
-  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-];
 
 /**
- * Main extraction prompt for digital text (Pass 1)
- * Used by BOTH Z.AI and Gemini - ensures consistent output
+ * Normalize amount string to number
  */
-const EXTRACTION_PROMPT = `You are an expert invoice data extraction system. Extract structured data from this invoice.
+function parseAmount(amountStr: string): number {
+  if (!amountStr) return 0;
 
-=== CRITICAL: VENDOR NAME EXTRACTION ===
-The VENDOR is the company ISSUING the invoice (the seller/biller).
-The CUSTOMER is the company RECEIVING the invoice (the buyer).
+  let cleaned = amountStr.replace(/[€$₹£\s]/g, '');
 
-STRICT RULES FOR VENDOR NAME:
-1. POSITIONING: The very first text at the top of the document is often the brand's logo text. Do NOT ignore short brand names (e.g., a single word) if they appear at the very top before any addresses. The Customer is usually listed further down, under labels like "Bill To", "Factuuradres", "Sold To", or simply below the vendor's address.
-2. NO REFERENCE CODES: Do not extract alphanumeric order IDs, customer numbers, or document IDs as the Vendor Name. Real company names usually contain natural words and often end with legal entity suffixes (Inc., B.V., Ltd., LLC, Corp., AG, etc.).
-3. TABULAR DATA: Never extract the vendor name from data inside tables under columns like "Customer", "Klant", "Order", or "Client".
-4. PROXY BILLING: If you see a legal entity acting on behalf of a brand (e.g., indicated by "iov", "i.o.v.", "in opdracht van", or "on behalf of"), the VENDOR NAME should be the MAIN BRAND being represented, not the proxy legal entity. Look for the main brand name at the absolute top of the document.
-5. SHIPPING/CONTACT PERSONS: Names located under "Bill To", "Ship To", "Factuuradres", "Afleveradres", or "Klant" are ALWAYS the CUSTOMER or CONTACT PERSON. NEVER extract them as the Vendor.
-6. PLACEHOLDER NAMES: Ignore generic placeholder customer names (e.g., "YourCompany", "Your Company", "Strategic Corp", "bosd") or lowercase individual contact names - these are NOT the vendor.
-7. TAGLINES & SLOGANS: Do not extract generic industry descriptions, taglines, or slogans (e.g., "Global Wholesaler", "Premium Services", "Logistics") as the Vendor Name. Look for the actual brand name.
-8. STRICT CUSTOMER AVOIDANCE: Any entity located directly AFTER the word "Factuuradres" (Invoice Address) or directly BEFORE the word "T.a.v." (Ter attentie van) is the CUSTOMER. NEVER extract it. The vendor will be somewhere else (often at the very top).
+  // Handle European format (1.234,56) vs US format (1,234.56)
+  if (/\.\d{3},/.test(cleaned)) {
+    cleaned = cleaned.replace(/\./g, '').replace(',', '.');
+  } else if (/,\d{3}\./.test(cleaned)) {
+    cleaned = cleaned.replace(/,/g, '');
+  } else if (/,\d{2}$/.test(cleaned)) {
+    cleaned = cleaned.replace(',', '.');
+  } else {
+    cleaned = cleaned.replace(/,/g, '');
+  }
 
-=== TAX ID EXTRACTION ===
-Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number", "BTW-nr"
-- The VENDOR's Tax ID is usually near the vendor's company name, footer, or issuer details.
-- Labels like "Uw BTW nummer", "Your VAT", or "Customer VAT" indicate the CUSTOMER's tax ID. Do NOT extract these.
-- Include country prefixes if present (e.g., FR, NL, DE, US).
-- If no vendor tax ID is clearly identifiable, return null.
-
-=== AMOUNT EXTRACTION ===
-- Look for "Grand Total", "Total", "Totaal", "Factuur totaal" for the final amount.
-- Subtotal is the amount BEFORE tax.
-- Verify: subtotal + tax ≈ total.
-- Do not include digits from product codes or row numbers.
-
-=== INVOICE NUMBER ===
-- Extract the EXACT full string including any letter prefixes, dashes, or slashes.
-- Do NOT strip letters from the invoice number (e.g., "INV-2024-001" stays as-is, not "2024001").
-
-=== LINE ITEMS ===
-- Extract ALL rows from the items table, including those with a 0.00 price or discount lines.
-- Do not skip any items regardless of their value.
-
-=== REQUIRED JSON OUTPUT ===
-Return ONLY a JSON object with these exact field names. Do NOT use markdown code blocks. Return raw JSON only:
-{
-  "invoiceNumber": "string (exact value, do not strip prefixes)",
-  "vendorName": "string",
-  "vendorTaxId": "string or null",
-  "issueDate": "YYYY-MM-DD",
-  "dueDate": "YYYY-MM-DD or null",
-  "currency": "USD/EUR/INR/etc",
-  "subtotal": number,
-  "taxAmount": number or null,
-  "totalAmount": number,
-  "lineItems": [{"description": "string", "quantity": number, "unitPrice": number, "total": number}]
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
 }
-
-INVOICE TEXT:
-`;
 
 /**
- * Targeted prompt for OCR patch extraction (Pass 2)
- * Used by BOTH Z.AI and Gemini
+ * Parse date string to YYYY-MM-DD format
  */
-const OCR_PATCH_PROMPT = `You are extracting vendor information from OCR text scanned from an invoice image.
+function parseDate(dateStr: string): string | null {
+  if (!dateStr) return null;
 
-TASK: Extract ONLY the vendor name and vendor tax ID. Ignore everything else.
-
-RULES FOR VENDOR NAME:
-1. The vendor is at the TOP of the document (often a logo/brand name).
-2. Short brand names are valid (e.g., a single word at the top).
-3. PROXY BILLING: If you see "iov", "i.o.v.", "in opdracht van", or "on behalf of", extract the MAIN BRAND being represented, not the proxy legal entity.
-4. Do NOT extract anything under "Factuuradres", "Bill To", "Ship To", "Klant", or "T.a.v." - those are customers.
-5. Ignore generic placeholders like "YourCompany" or taglines like "Global Wholesaler".
-
-RULES FOR TAX ID:
-1. Look for: "VAT", "BTW", "BTW-nr", "VAT Number", "Tax ID".
-2. Include country prefixes (e.g., NL, DE, FR).
-3. Do NOT extract "Uw BTW nummer" or "Your VAT" - those are customer Tax IDs.
-4. Return null if not found.
-
-RETURN ONLY raw JSON (no markdown, no code blocks, no explanation):
-{"vendorName": "string", "vendorTaxId": "string or null"}
-
-OCR TEXT:
-`;
-
-// ============================================
-// PRIMARY EXTRACTION: Z.AI (Anthropic SDK)
-// ============================================
-async function extractWithZAI(prompt: string): Promise<string> {
-  const startTime = Date.now();
-  console.log(`[Z.AI Primary] Calling model: ${PRIMARY_MODEL}`);
-
-  const message = await anthropic.messages.create({
-    model: PRIMARY_MODEL,
-    max_tokens: 4096,
-    messages: [
-      {
-        role: 'user',
-        content: prompt,
-      },
-    ],
-  });
-
-  const textBlock = message.content.find((block) => block.type === 'text');
-  if (!textBlock || textBlock.type !== 'text') {
-    throw new Error('No text response from Z.AI');
+  // Try ISO format first
+  const isoMatch = dateStr.match(/(\d{4})[-\/](\d{2})[-\/](\d{2})/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
   }
 
-  const duration = Date.now() - startTime;
-  console.log(`[Z.AI Primary] Response received in ${duration}ms, length: ${textBlock.text.length}`);
-
-  return textBlock.text;
-}
-
-// ============================================
-// SECONDARY EXTRACTION: Google Gemini (Fallback)
-// ============================================
-async function extractWithGemini(prompt: string): Promise<string> {
-  const startTime = Date.now();
-  console.log(`[Gemini Fallback] Calling model: ${FALLBACK_MODEL}`);
-
-  const model = genAI.getGenerativeModel({ model: FALLBACK_MODEL });
-
-  const result = await model.generateContent({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 4096,
-      responseMimeType: 'application/json',
-    },
-    safetySettings: GEMINI_SAFETY_SETTINGS,
-  });
-
-  const response = result.response;
-  const text = response.text();
-  const duration = Date.now() - startTime;
-
-  console.log(`[Gemini Fallback] Response received in ${duration}ms, length: ${text.length}`);
-
-  if (response.promptFeedback?.blockReason) {
-    console.warn(`[Gemini Fallback] Prompt blocked: ${response.promptFeedback.blockReason}`);
+  // European format DD-MM-YYYY or DD/MM/YYYY
+  const euMatch = dateStr.match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+  if (euMatch) {
+    const day = euMatch[1].padStart(2, '0');
+    const month = euMatch[2].padStart(2, '0');
+    return `${euMatch[3]}-${month}-${day}`;
   }
 
-  return text;
-}
+  // Named month format
+  const months: Record<string, number> = {
+    'jan': 1, 'januari': 1, 'janvier': 1, 'januar': 1,
+    'feb': 2, 'februari': 2, 'février': 2, 'februar': 2,
+    'mar': 3, 'maart': 3, 'mars': 3, 'märz': 3,
+    'apr': 4, 'april': 4, 'avril': 4,
+    'may': 5, 'mei': 5, 'mai': 5,
+    'jun': 6, 'juni': 6, 'juin': 6,
+    'jul': 7, 'juli': 7, 'juillet': 7,
+    'aug': 8, 'augustus': 8, 'août': 8, 'august': 8,
+    'sep': 9, 'september': 9, 'septembre': 9, 'sept': 9,
+    'oct': 10, 'oktober': 10, 'octobre': 10, 'okt': 10,
+    'nov': 11, 'november': 11, 'novembre': 11,
+    'dec': 12, 'december': 12, 'décembre': 12, 'dez': 12, 'dezember': 12,
+  };
 
-// ============================================
-// FALLBACK WRAPPER: Try Primary, Fall back to Secondary
-// ============================================
-async function extractWithFallback(prompt: string): Promise<string> {
-  // Try Z.AI Primary first
-  try {
-    return await extractWithZAI(prompt);
-  } catch (primaryError) {
-    console.warn('[Extraction] Z.AI primary extraction failed. Falling back to Gemini...');
-    console.warn(`[Extraction] Primary error: ${primaryError instanceof Error ? primaryError.message : primaryError}`);
-
-    // Fall back to Gemini
-    try {
-      return await extractWithGemini(prompt);
-    } catch (fallbackError) {
-      console.error('[Extraction] Gemini fallback also failed!');
-      console.error(`[Extraction] Fallback error: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`);
-      throw primaryError; // Throw the original error
-    }
-  }
-}
-
-// ============================================
-// JSON PARSING: Robust handling of various formats
-// ============================================
-function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
-  try {
-    let jsonStr = rawResponse.trim();
-
-    // Robust markdown stripping - handle multiple variations
-    jsonStr = jsonStr
-      .replace(/```json\s*/gi, '')
-      .replace(/```\s*/g, '')
-      .replace(/^[^{]*/, '')
-      .replace(/[^}]*$/, '');
-
-    if (!jsonStr.startsWith('{')) {
-      jsonStr = rawResponse.trim();
-      if (jsonStr.startsWith('```json')) {
-        jsonStr = jsonStr.slice(7);
-      } else if (jsonStr.startsWith('```')) {
-        jsonStr = jsonStr.slice(3);
-      }
-      if (jsonStr.endsWith('```')) {
-        jsonStr = jsonStr.slice(0, -3);
+  const lowerDate = dateStr.toLowerCase();
+  for (const [monthName, monthNum] of Object.entries(months)) {
+    if (lowerDate.includes(monthName)) {
+      const dayMatch = dateStr.match(/(\d{1,2})/);
+      const yearMatch = dateStr.match(/(\d{4})/);
+      if (dayMatch && yearMatch) {
+        const day = dayMatch[1].padStart(2, '0');
+        const month = monthNum.toString().padStart(2, '0');
+        return `${yearMatch[1]}-${month}-${day}`;
       }
     }
+  }
 
-    jsonStr = jsonStr.trim();
+  return null;
+}
 
-    // Try to find JSON object in the string
-    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[0];
-    }
+// ============================================
+// EXTRACTION FUNCTIONS
+// ============================================
 
-    const parsed = JSON.parse(jsonStr) as ExtractedData;
-    console.log('[JSON Parser] Successfully parsed response');
-    return parsed;
-  } catch (parseError) {
-    console.error('[JSON Parser] Failed to parse response');
-    console.error('[JSON Parser] First 500 chars:', rawResponse.substring(0, 500));
-    console.error('[JSON Parser] Parse error:', parseError instanceof Error ? parseError.message : parseError);
+// Helper: Check if value looks like a date
+function looksLikeDate(value: string): boolean {
+  // Match patterns like 8-9-2022, 03/20/2023, 2023-03-20
+  if (/^\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}$/.test(value)) return true;
+  if (/^\d{4}[-\/]\d{1,2}[-\/]\d{1,2}$/.test(value)) return true;
+  return false;
+}
 
-    // Try one more approach: extract everything between first { and last }
-    try {
-      const firstBrace = rawResponse.indexOf('{');
-      const lastBrace = rawResponse.lastIndexOf('}');
-      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-        const extracted = rawResponse.substring(firstBrace, lastBrace + 1);
-        const parsed = JSON.parse(extracted) as ExtractedData;
-        console.log('[JSON Parser] Recovered using brace extraction');
-        return parsed;
+// Helper: Check if value is an IBAN
+function isIban(value: string): boolean {
+  const clean = value.replace(/\s/g, '');
+  return /^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(clean);
+}
+
+// Helper: Check if value is a Tax ID (VAT number)
+function isTaxIdPattern(value: string): boolean {
+  const clean = value.replace(/\s/g, '');
+  return /^[A-Z]{2}\d{9,12}[A-Z0-9]{0,3}$/.test(clean);
+}
+
+/**
+ * Extract invoice number
+ */
+function extractInvoiceNumber(text: string): string {
+  const lines = text.split('\n');
+
+  // Pattern: "# invoice_number_1" (literal hash followed by invoice number)
+  for (const line of lines.slice(0, 30)) {
+    const hashMatch = line.match(/^#\s*(invoice[_\w\d]+)$/i);
+    if (hashMatch) return hashMatch[1];
+  }
+
+  // Pattern: "Invoice INV/2023/03/0008" or "Invoice #123"
+  for (const line of lines.slice(0, 40)) {
+    const invMatch = line.match(/^Invoice\s+([A-Z]{2,4}[\/\-]?\d{2,4}[\/\-]?\d{2,8})$/i);
+    if (invMatch) return invMatch[1];
+  }
+
+  // Pattern: "Facture n°562044387" (French)
+  for (const line of lines.slice(0, 40)) {
+    const frMatch = line.match(/Facture\s*n[°º]\s*(\d{6,})/i);
+    if (frMatch) return frMatch[1];
+  }
+
+  // Pattern: Number BEFORE label (PDF extraction quirk)
+  // e.g., "993548900Factuurnummer:"
+  for (const line of lines.slice(0, 40)) {
+    const beforeLabelMatch = line.match(/(\d{6,})(?:Factuurnummer|Invoice Number|Rechnungsnr|Facture|nummer|number)/i);
+    if (beforeLabelMatch) {
+      const value = beforeLabelMatch[1];
+      if (!looksLikeDate(value) && !isIban(value) && !isTaxIdPattern(value)) {
+        return value;
       }
-    } catch {
-      console.error('[JSON Parser] Brace extraction also failed');
     }
-
-    return null;
   }
-}
 
-function parseOcrPatchResponse(rawResponse: string): { vendorName: string | null; vendorTaxId: string | null } | null {
-  try {
-    let jsonStr = rawResponse.trim();
-
-    jsonStr = jsonStr
-      .replace(/```json\s*/gi, '')
-      .replace(/```\s*/g, '')
-      .trim();
-
-    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[0];
-    }
-
-    const parsed = JSON.parse(jsonStr);
-    return {
-      vendorName: parsed.vendorName || null,
-      vendorTaxId: parsed.vendorTaxId || null,
-    };
-  } catch (parseError) {
-    console.error('[JSON Parser] OCR patch parse failed:', parseError instanceof Error ? parseError.message : parseError);
-    console.error('[JSON Parser] Raw response:', rawResponse.substring(0, 300));
-    return null;
-  }
-}
-
-/**
- * Calculate confidence based on required fields
- */
-function calculateConfidence(data: ExtractedData | null): number {
-  if (!data) return 0;
-  const requiredFields = ['invoiceNumber', 'vendorName', 'totalAmount', 'currency'];
-  const presentFields = requiredFields.filter(
-    (field) =>
-      data[field as keyof ExtractedData] !== null &&
-      data[field as keyof ExtractedData] !== undefined &&
-      data[field as keyof ExtractedData] !== ''
-  );
-  return presentFields.length / requiredFields.length;
-}
-
-/**
- * Check if digital extraction needs OCR patching
- */
-function needsOcrPatch(data: ExtractedData | null): boolean {
-  if (!data) return true;
-
-  const vendorName = data.vendorName?.toLowerCase().trim() || '';
-  const placeholderPatterns = [
-    'your',
-    'yourcompany',
-    'strategic corp',
-    'bosd',
-    'unknown',
-    'n/a',
-    'placeholder',
+  // Pattern: Label followed by number (standard or no separator)
+  // e.g., "Invoice Number:42183017"
+  const labeledPatterns = [
+    /(?:Invoice\s*Number|Invoice\s*No)[\s:#]*([A-Z0-9][\w\-\/]{4,25})/i,
+    /(?:Factuur|Facture)\s*(?:nummer|n[°º])?[\s:#]*([A-Z0-9][\w\-\/]{4,25})/i,
+    /(?:Rechnungsnr\.?|Kundenrn\.?)[\s:#]*([A-Z0-9][\w\-\/]{3,20})/i,
   ];
 
-  const isPlaceholder = !vendorName ||
-                        vendorName.length < 2 ||
-                        placeholderPatterns.some(p => vendorName.includes(p));
+  for (const line of lines.slice(0, 40)) {
+    for (const pattern of labeledPatterns) {
+      const match = line.match(pattern);
+      if (match && match[1]) {
+        const value = match[1].trim().replace(/^#/, '').replace(/^:\s*/, '');
+        if (value.length >= 4 && !looksLikeDate(value) && !isIban(value) && !isTaxIdPattern(value)) {
+          if (!/^(total|sub|tax|vat|btw|date|datum)$/i.test(value)) {
+            return value;
+          }
+        }
+      }
+    }
+  }
 
-  const missingTaxId = !data.vendorTaxId || data.vendorTaxId.trim() === '';
+  // Pattern: Label on one line, number on next
+  // e.g., "Rechnungsnr.\n47774"
+  for (let i = 0; i < Math.min(lines.length - 1, 40); i++) {
+    const line = lines[i].trim();
+    // Match "Rechnungsnr." or "Invoice Number" or similar at end of line
+    if (/(?:Rechnungsnr|Invoice\s*No|Factuur|nummer)\.?\s*$/i.test(line)) {
+      const nextLine = lines[i + 1]?.trim();
+      if (nextLine && /^\d{4,10}$/.test(nextLine)) {
+        if (!looksLikeDate(nextLine)) {
+          return nextLine;
+        }
+      }
+    }
+  }
 
-  return isPlaceholder || missingTaxId;
+  // Pattern: Contract Number fallback
+  const contractMatch = text.match(/Contract\s*No\.?\s*[:\s]*([A-Z0-9]{5,15})/i);
+  if (contractMatch) return contractMatch[1];
+
+  // Pattern: Invoice format like INV-2024-001, FAC-123, SCONL000000444
+  const formatPatterns = [
+    /\b(SCO[A-Z]{0,2}\d{9,12})\b/gi,
+    /\b(INV[\/\-]\d{4}[\/\-]\d{2,8})\b/gi,
+    /\b(FAC[-]?\d{4,})\b/gi,
+    /\b([A-Z]{2,3}\d{8,})\b/gi,
+  ];
+
+  for (const pattern of formatPatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const value = match[1]?.trim();
+      if (value && value.length >= 5 && value.length <= 30) {
+        if (!looksLikeDate(value) && !isIban(value) && !isTaxIdPattern(value)) {
+          return value;
+        }
+      }
+    }
+  }
+
+  // Long numeric invoice numbers (8+ digits) near the top
+  const topText = lines.slice(0, 40).join('\n');
+  const numMatches = [...topText.matchAll(/\b(\d{8,12})\b/g)];
+  for (const match of numMatches) {
+    const value = match[1];
+    if (!looksLikeDate(value) && !isIban(value) && !isTaxIdPattern(value)) {
+      return value;
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Extract tax ID (VAT/BTW/GSTIN)
+ */
+function extractTaxId(text: string): string | null {
+  // PRIORITY 1: Dutch VAT with BXX suffix optionally followed by BTW (e.g., "NL810433941B01BTW")
+  // NL VAT format: NL + 9 digits + B + 2 digits (e.g., NL810433941B01)
+  const nlVatWithBtw = /\b(NL)(\d{9})(B\d{2})(?:BTW|TVA)?\b/gi;
+  const nlMatches = [...text.matchAll(nlVatWithBtw)];
+  for (const match of nlMatches) {
+    const value = (match[1] + match[2] + match[3]).toUpperCase();
+    if (value.length === 14) { // NL + 9 digits + B01 = 14 chars
+      return value;
+    }
+  }
+
+  // PRIORITY 2: Line-based labeled tax IDs (must be on same line!)
+  const lines = text.split('\n');
+  for (const line of lines) {
+    // Skip lines that are clearly invoice number lines (not tax ID lines)
+    if (/(?:Factuurnummer|Invoice\s*Number|Invoice\s*No|Rechnungsnr|Kundenrn)/i.test(line)) continue;
+    if (/^\d{6,}(?:Factuurnummer|Invoice)/i.test(line)) continue;
+
+    // Look for tax ID labels on this line
+    if (/(?:VAT\s*(?:ID|Number|No)|BTW\s*(?:nummer|ID)|TVA\s*(?:intra|ID)|MwSt\s*(?:ID|Nummer)|GSTIN|GST\s*(?:ID|Number)|Uw\s*BTW\s*nummer|N°\s*de\s*TVA)/i.test(line)) {
+      // Extract the tax ID from this line
+      const taxIdMatch = line.match(/([A-Z]{0,2}\d{9,12}[A-Z0-9]{0,3})\b/i);
+      if (taxIdMatch) {
+        let value = taxIdMatch[1].replace(/\s+/g, '').toUpperCase();
+        value = value.replace(/(BTW|TVA|MWST)$/i, '');
+        if (value.length >= 10 && value.length <= 15) {
+          return value;
+        }
+      }
+    }
+  }
+
+  // PRIORITY 3: General EU VAT with country code prefix (but not on invoice number lines)
+  const euVatPattern = /\b(NL|DE|FR|BE|ES|IT|AT|PT|LU|PL)\s*(\d{9,12})\s*([A-Z]{0,2}\d{0,2})\b/gi;
+  const euMatches = [...text.matchAll(euVatPattern)];
+  for (const match of euMatches) {
+    const fullMatch = match[0];
+    const country = match[1] || '';
+    const numbers = match[2] || '';
+    const suffix = match[3] || '';
+
+    // Find the line containing this match
+    const matchIndex = match.index || 0;
+    const lineStart = text.lastIndexOf('\n', matchIndex);
+    const lineEnd = text.indexOf('\n', matchIndex);
+    const line = text.slice(Math.max(0, lineStart + 1), lineEnd > 0 ? lineEnd : undefined);
+
+    // Skip if on an invoice number line
+    if (/(?:Factuurnummer|Invoice\s*Number|Invoice\s*No|Rechnungsnr|Kundenrn)/i.test(line)) continue;
+
+    // Skip if this looks like an IBAN (country code + 2 check digits + many alphanumeric)
+    if (/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(fullMatch.replace(/\s/g, ''))) continue;
+
+    const value = (country + numbers + suffix).replace(/\s/g, '').toUpperCase();
+    // Valid VAT: 10-15 chars
+    if (value.length >= 10 && value.length <= 15) {
+      return value;
+    }
+  }
+
+  // PRIORITY 4: French TVA format with spaces: FR 604 219 388 61
+  const frTvaMatch = text.match(/N°\s*de\s*TVA[^:]*[:\s]+FR\s*(\d{3})\s*(\d{3})\s*(\d{3})\s*(\d{2})/i);
+  if (frTvaMatch) {
+    const value = 'FR' + frTvaMatch[1] + frTvaMatch[2] + frTvaMatch[3] + frTvaMatch[4];
+    return value;
+  }
+
+  // PRIORITY 5: GSTIN (India) - 15 characters
+  const gstinMatch = text.match(/\b(\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z]Z[A-Z0-9])\b/i);
+  if (gstinMatch) {
+    return gstinMatch[1].toUpperCase();
+  }
+
+  return null;
+}
+
+/**
+ * Extract vendor name from the top of the document
+ */
+function extractVendorName(text: string): string {
+  const lines = text.split('\n');
+
+  // Skip these words - they are not vendor names (lowercase matching)
+  const skipWords = [
+    'factuur', 'invoice', 'rechnung', 'facture', 'bill', 'credit', 'debit',
+    'nummer', 'number', 'datum', 'date', 'page', 'pagina', 'blz',
+    'total', 'totaal', 'subtotal', 'subtotaal', 'vat', 'btw', 'tax',
+    'bedrag', 'amount', 'quantity', 'qty', 'aantal', 'price', 'prijs',
+    'www', 'http', 'https', 'email', 'tel', 'fax', 'phone',
+    'payment receipt', 'receipt', 'payment',
+    'description', 'omschrijving', 'artikel',
+    'klant', 'customer', 'bill to', 'ship to',
+    'global wholesaler', 'your company', 'service provider',
+  ];
+
+  // Company suffix patterns - allow optional space and periods in B.V. and N.V.
+  // Company suffix patterns - allow optional space in B.V. and N.V.
+  // Use (?:\b|$) to allow matching at end of string or which "Coolblue B.V." matches
+  const companySuffixes = /\b(inc|ltd|llc|corp|corporation|gmbh|ag|sa|bv|nv|co|b\. ?v\.|n\. ?v\.|pvt|limited|bvba|sprl|sas)(?:\b|$)/i;
+
+  // Check if a line looks like a company name
+  const looksLikeCompanyName = (line: string): { valid: boolean; priority: number } => {
+    if (!line || line.length < 2 || line.length > 70) return { valid: false, priority: 0 };
+
+    const trimmed = line.trim();
+    const lowerLine = trimmed.toLowerCase();
+
+    // Skip if it starts with or is a common invoice header word
+    for (const word of skipWords) {
+      if (lowerLine === word || lowerLine.startsWith(word + '.') || lowerLine.startsWith(word + ' ')) {
+        return { valid: false, priority: 0 };
+      }
+    }
+
+    // Skip tax IDs and VAT numbers (e.g., NL810433941B01BTW)
+    if (/^[A-Z]{2}\d{9,12}[A-Z0-9]{0,4}$/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/i.test(trimmed)) return { valid: false, priority: 0 }; // IBAN
+    if (/^(NL|DE|FR|BE|ES|IT)\d{9,12}/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip BIC/SWIFT codes (8 or 11 characters: 4 letters bank + 2 country + 2 location + optional 3 branch)
+    if (/^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip postal codes + cities (e.g., "69100 VILLEURBANNE")
+    if (/^\d{4,5}\s+[A-Z]{2,}$/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^\d{4}\s*[A-Z]{2}\s/i.test(trimmed)) return { valid: false, priority: 0 }; // Dutch postal code
+
+    // Skip pure numbers
+    if (/^\d+$/.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip dates
+    if (/^\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}$/.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip addresses
+    if (/^(street|straat|weg|laan|road|avenue|place|plaza|lane|drive|rue)/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^(postcode|zip|po box|postbus)/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^\d{4}\s*[A-Z]{2}/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/^\d+\s+(street|straat|road|ave|lane|rue)/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip contact info
+    if (/^(tel|phone|fax|email|www|http|web|mobiel|mobile|\()/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines that are all lowercase (probably not company names)
+    if (/^[a-z\s\d\.,]+$/.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip header table rows
+    if (/description.*quantity.*price/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/artikel.*omschrijving.*prijs/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines that look like bank details
+    if (/^(IBAN|BIC|SWIFT|Kto-Nr|Blz|Bank)/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines starting with "au capital" (French company legal text)
+    if (/^au capital/i.test(trimmed)) return { valid: false, priority: 0 };
+    if (/−\s*B\s*\d+.*RCS/i.test(trimmed)) return { valid: false, priority: 0 }; // French company registration
+
+    // Skip product lines with SKU codes in brackets (e.g., "[17589684]")
+    if (/^\[?\s*\d{6,}\]?/.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines that look like product lines with measurements
+    if (/^\d+\s*(x\s*)?(kg|g|ml|l|pcs|st|ct|lb|oz|fl|ea)\b/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines that look like "sold by" sentences
+    if (/^sold by\s+/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines with "service" and subscription-related suffixes (like "Service Abonn", "Services Pvt")
+    if (/\bservice\s+(abonn|subscri|support)/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Skip lines that look like customer reference numbers (Numéro de dossier)
+    if (/^(numéro|numero)\s+de\s+dossier/i.test(trimmed)) return { valid: false, priority: 0 };
+
+    // Calculate priority
+    let priority = 1;
+    if (companySuffixes.test(trimmed)) priority = 3; // Highest priority for company suffixes
+    else if (/^[A-Z][a-z]+(\s+[A-Z][a-z]+)+/.test(trimmed)) priority = 2; // Title Case
+    else if (/[A-Z]{2,}/.test(trimmed)) priority = 2; // Contains acronyms
+
+    return { valid: true, priority };
+  };
+
+  // Collect candidates with priorities
+  const candidates: { name: string; priority: number; index: number }[] = [];
+
+  for (let i = 0; i < Math.min(40, lines.length); i++) {
+    const line = lines[i]?.trim();
+    if (!line) continue;
+
+    const { valid, priority } = looksLikeCompanyName(line);
+    if (!valid) continue;
+
+    // Clean up the name
+    let name = line
+      .replace(/[^\w\s\.\-&,']/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    name = name.replace(/\s+\d+$/g, '').trim();
+
+    if (name.length >= 2 && name.length <= 60) {
+      candidates.push({ name, priority, index: i });
+    }
+  }
+
+  // Sort by priority (higher first), then by position (earlier first)
+  candidates.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    return a.index - b.index;
+  });
+
+  // Return the highest priority candidate
+  if (candidates.length > 0) {
+    return candidates[0].name;
+  }
+
+  return 'Unknown Vendor';
+}
+
+/**
+ * Extract currency
+ */
+function extractCurrency(text: string): string {
+  if (/€/.test(text)) return 'EUR';
+  if (/₹/.test(text)) return 'INR';
+  if (/£/.test(text)) return 'GBP';
+  if (/\$\s*[\d]/.test(text)) return 'USD';
+
+  // Language hints
+  if (/btw|totaal|factuur/i.test(text)) return 'EUR';
+  if (/mwst|rechnung|betrag/i.test(text)) return 'EUR';
+  if (/tva|facture|montant/i.test(text)) return 'EUR';
+  if (/gst|₹/i.test(text)) return 'INR';
+
+  return 'USD';
+}
+
+/**
+ * Extract amounts (total, subtotal, tax)
+ */
+function extractAmounts(text: string): { total: number; subtotal: number; tax: number } {
+  let total = 0;
+  let subtotal = 0;
+  let tax = 0;
+
+  // Find total amount - look for the largest amount near "total" keyword
+  const totalPatterns = [
+    /(?:total|totaal|gesamtbetrag|montant total|grand total|factuur totaal|end total|amount due)[^€$₹£\d]*(?:[€$₹£]?\s*([\d,.]+))/gi,
+    /(?:totaal|total)\s*(?:bedrag|amount)?[^€$₹£\d]*([€$₹£]?\s*[\d,.]+)/gi,
+  ];
+
+  for (const pattern of totalPatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const amount = parseAmount(match[1]);
+      if (amount > total) {
+        total = amount;
+      }
+    }
+  }
+
+  // Find subtotal
+  const subtotalPatterns = [
+    /(?:subtotal|subtotaal|zwischen-summe|sous-total|nett|netto)[^€$₹£\d]*([€$₹£]?\s*[\d,.]+)/gi,
+  ];
+
+  for (const pattern of subtotalPatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const amount = parseAmount(match[1]);
+      if (amount > subtotal) {
+        subtotal = amount;
+      }
+    }
+  }
+
+  // Find tax
+  const taxPatterns = [
+    /(?:vat|btw|mwst|tva|tax|gst)[^€$₹£\d]*([€$₹£]?\s*[\d,.]+)/gi,
+    /(?:btw|vat)\s*\(?[\d.]+%?\)?[^€$₹£\d]*([€$₹£]?\s*[\d,.]+)/gi,
+  ];
+
+  for (const pattern of taxPatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const amount = parseAmount(match[1]);
+      if (amount > 0 && (total === 0 || amount < total)) {
+        tax = Math.max(tax, amount);
+      }
+    }
+  }
+
+  // If no total found, find the largest standalone amount
+  if (total === 0) {
+    const allAmounts = [...text.matchAll(/[€$₹£]?\s*([\d,.]+)/g)];
+    for (const match of allAmounts) {
+      const amount = parseAmount(match[1]);
+      if (amount > total) {
+        total = amount;
+      }
+    }
+  }
+
+  // Calculate missing values
+  if (subtotal === 0 && total > 0) {
+    subtotal = tax > 0 ? total - tax : total;
+  }
+  if (tax === 0 && subtotal > 0 && total > subtotal) {
+    tax = total - subtotal;
+  }
+
+  return {
+    total: Math.round(total * 100) / 100,
+    subtotal: Math.round(subtotal * 100) / 100,
+    tax: Math.round(tax * 100) / 100
+  };
+}
+
+/**
+ * Extract dates
+ */
+function extractDates(text: string): { issueDate: string | null; dueDate: string | null } {
+  let issueDate: string | null = null;
+  let dueDate: string | null = null;
+
+  // Issue date patterns
+  const issuePatterns = [
+    /(?:invoice|factuur|rechnung|facture)\s*(?:date|datum)?[^:]*[:\s]+([^\n]+)/gi,
+    /(?:date|datum)\s*[:\s]+(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/gi,
+    /(?:date|datum)\s*[:\s]+(\d{4}[-\/]\d{2}[-\/]\d{2})/gi,
+  ];
+
+  outer:
+  for (const pattern of issuePatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const parsed = parseDate(match[1] || match[0]);
+      if (parsed) {
+        issueDate = parsed;
+        break outer;
+      }
+    }
+  }
+
+  // Due date patterns
+  const duePatterns = [
+    /(?:due|payment|verval|fälligkeit|échéance)\s*(?:date|datum)?[^:]*[:\s]+(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/gi,
+    /(?:due|payment|verval|fälligkeit|échéance)\s*(?:date|datum)?[^:]*[:\s]+(\d{4}[-\/]\d{2}[-\/]\d{2})/gi,
+  ];
+
+  outer2:
+  for (const pattern of duePatterns) {
+    const matches = [...text.matchAll(pattern)];
+    for (const match of matches) {
+      const parsed = parseDate(match[1] || match[0]);
+      if (parsed && parsed !== issueDate) {
+        dueDate = parsed;
+        break outer2;
+      }
+    }
+  }
+
+  // Fallback: find first date in document
+  if (!issueDate) {
+    const dateMatch = text.match(/(\d{4}[-\/]\d{2}[-\/]\d{2})|(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/);
+    if (dateMatch) {
+      issueDate = parseDate(dateMatch[0]);
+    }
+  }
+
+  return { issueDate, dueDate };
+}
+
+/**
+ * Extract line items (simplified)
+ */
+function extractLineItems(text: string): LineItem[] {
+  const items: LineItem[] = [];
+
+  // Simple approach: find product-like lines with prices
+  const lines = text.split('\n');
+
+  for (const line of lines) {
+    if (!line.trim() || line.length < 10) continue;
+
+    // Skip header lines
+    if (/^(item|description|qty|price|total|product|artikel)/i.test(line)) continue;
+
+    // Pattern: text followed by amount
+    const match = line.match(/^(.+?)\s{2,}[\$€£₹]?([\d,.]+)\s*$/);
+    if (match && match[1] && match[2]) {
+      const description = match[1].trim();
+      const total = parseAmount(match[2]);
+
+      if (description.length > 3 && total > 0) {
+        items.push({
+          description,
+          quantity: 1,
+          unitPrice: total,
+          total,
+        });
+      }
+    }
+  }
+
+  return items.slice(0, 20); // Limit to 20 items
 }
 
 /**
@@ -328,7 +637,7 @@ function needsOcrPatch(data: ExtractedData | null): boolean {
  */
 async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
   try {
-    console.log('Starting OCR.space extraction...');
+    console.log('[OCR] Starting OCR.space extraction...');
 
     const uint8Array = new Uint8Array(pdfBuffer);
     const blob = new Blob([uint8Array], { type: 'application/pdf' });
@@ -344,7 +653,7 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
     });
 
     if (!response.ok) {
-      console.error('OCR.space API error:', response.status, response.statusText);
+      console.error('[OCR] API error:', response.status);
       return '';
     }
 
@@ -354,48 +663,22 @@ async function extractWithOcrSpace(pdfBuffer: Buffer): Promise<string> {
     };
 
     if (result.ErrorMessage) {
-      console.error('OCR.space error message:', result.ErrorMessage);
+      console.error('[OCR] Error:', result.ErrorMessage);
       return '';
     }
 
     const ocrText = result.ParsedResults?.[0]?.ParsedText || '';
-    console.log('OCR.space extracted text length:', ocrText.length);
+    console.log('[OCR] Extracted text length:', ocrText.length);
 
     return ocrText;
   } catch (error) {
-    console.error('OCR.space extraction error:', error);
+    console.error('[OCR] Extraction error:', error);
     return '';
   }
 }
 
 /**
- * Extract vendor info from OCR text using fallback architecture
- */
-async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName: string | null; vendorTaxId: string | null } | null> {
-  try {
-    console.log('Extracting vendor patch from OCR text...');
-
-    const response = await extractWithFallback(OCR_PATCH_PROMPT + '\n\n' + ocrText);
-
-    const patch = parseOcrPatchResponse(response);
-    if (patch) {
-      console.log('OCR patch extracted:', patch);
-    }
-    return patch;
-  } catch (error) {
-    console.error('OCR patch extraction error:', error);
-    return null;
-  }
-}
-
-/**
- * Extract invoice data using Primary/Secondary fallback architecture
- *
- * PASS 1: Full digital extraction (pdf-parse → Z.AI → fallback to Gemini)
- * VALIDATION: Check if vendorName/vendorTaxId need patching
- * PASS 2: If needed, OCR → Z.AI → fallback to Gemini → patch original JSON
- * POST-PROCESSING: Validate vendor name against ERP using Tax ID
- * RETURN: Merged result with perfect financial data + patched vendor info
+ * Main extraction function - No AI Required
  */
 export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   data: ExtractedData | null;
@@ -404,13 +687,19 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   error?: string;
 }> {
   try {
-    // ========================================
-    // PASS 1: Full Digital Extraction
-    // ========================================
-    console.log('PASS 1: Starting digital text extraction...');
+    console.log('[Extraction] Starting non-AI extraction...');
 
+    // Extract text from PDF
     const pdfData = await pdf(pdfBuffer);
-    const pdfText = pdfData.text;
+    let pdfText = pdfData.text;
+
+    if (!pdfText || pdfText.trim().length < 50) {
+      console.log('[Extraction] PDF text too short, trying OCR...');
+      const ocrText = await extractWithOcrSpace(pdfBuffer);
+      if (ocrText.length > pdfText.length) {
+        pdfText = ocrText;
+      }
+    }
 
     if (!pdfText || pdfText.trim().length === 0) {
       return {
@@ -421,94 +710,71 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
       };
     }
 
-    console.log('Digital text length:', pdfText.length);
+    console.log('[Extraction] Text length:', pdfText.length);
 
-    // Use fallback architecture: Try Z.AI first, fall back to Gemini
-    const fullPrompt = EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY raw JSON with no markdown formatting or code blocks.';
-    const rawResponse = await extractWithFallback(fullPrompt);
+    // Get OCR text for additional validation
+    const ocrText = pdfText.length < 500 ? await extractWithOcrSpace(pdfBuffer) : '';
 
-    let extractedData = parseJsonFromResponse(rawResponse);
+    // Extract all fields
+    const invoiceNumber = extractInvoiceNumber(pdfText);
+    const vendorName = extractVendorName(pdfText);
+    const vendorTaxId = extractTaxId(pdfText + '\n' + ocrText);
+    const { issueDate, dueDate } = extractDates(pdfText);
+    const currency = extractCurrency(pdfText);
+    const { total, subtotal, tax } = extractAmounts(pdfText);
+    const lineItems = extractLineItems(pdfText);
 
-    if (!extractedData) {
-      return {
-        data: null,
-        confidence: 0,
-        rawResponse,
-        error: 'Failed to parse JSON response',
-      };
-    }
+    // Build result
+    const extractedData: ExtractedData = {
+      invoiceNumber,
+      vendorName,
+      vendorTaxId: vendorTaxId || '',
+      issueDate: issueDate || new Date().toISOString().split('T')[0],
+      dueDate,
+      currency,
+      subtotal,
+      taxAmount: tax,
+      totalAmount: total,
+      lineItems,
+    };
 
-    console.log('PASS 1 complete. Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
+    // Calculate confidence
+    let confidence = 0;
+    if (extractedData.invoiceNumber && extractedData.invoiceNumber.length >= 4) confidence += 0.25;
+    if (extractedData.vendorName && extractedData.vendorName !== 'Unknown Vendor') confidence += 0.25;
+    if (extractedData.totalAmount > 0) confidence += 0.25;
+    if (extractedData.currency) confidence += 0.15;
+    if (extractedData.vendorTaxId) confidence += 0.10;
 
-    // Track OCR text for combined search in post-processing
-    let ocrText = '';
+    console.log('[Extraction] Complete. Confidence:', confidence.toFixed(2));
+    console.log('[Extraction] Vendor:', extractedData.vendorName);
+    console.log('[Extraction] Invoice #:', extractedData.invoiceNumber);
+    console.log('[Extraction] Tax ID:', extractedData.vendorTaxId || 'N/A');
+    console.log('[Extraction] Total:', extractedData.totalAmount, extractedData.currency);
 
-    // ========================================
-    // VALIDATION: Check if OCR patch needed
-    // ========================================
-    if (needsOcrPatch(extractedData)) {
-      // ========================================
-      // PASS 2: Targeted OCR Patch
-      // ========================================
-      console.log('PASS 2: OCR patch needed - extracting from images...');
-
-      ocrText = await extractWithOcrSpace(pdfBuffer);
-
-      if (ocrText && ocrText.trim().length > 0) {
-        const vendorPatch = await extractVendorPatchFromOcr(ocrText);
-
-        if (vendorPatch) {
-          if (vendorPatch.vendorName) {
-            console.log('Patching vendorName:', extractedData.vendorName, '→', vendorPatch.vendorName);
-            extractedData.vendorName = vendorPatch.vendorName;
-          }
-          if (vendorPatch.vendorTaxId) {
-            console.log('Patching vendorTaxId:', extractedData.vendorTaxId, '→', vendorPatch.vendorTaxId);
-            extractedData.vendorTaxId = vendorPatch.vendorTaxId;
-          }
-        }
-      } else {
-        console.log('OCR extraction failed or empty - keeping digital result');
-      }
-
-      console.log('PASS 2 complete. Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
-    }
-
-    // ========================================
-    // POST-PROCESSING: ERP Vendor Name Validation
-    // ========================================
+    // Post-processing: ERP validation
     if (extractedData.vendorTaxId) {
-      console.log('POST-PROCESSING: Validating vendor name against ERP...');
-
+      console.log('[Extraction] Validating against ERP...');
       const erpCompany = await findCompanyByTaxId(extractedData.vendorTaxId);
 
       if (erpCompany) {
-        console.log('ERP found company by Tax ID:', erpCompany.name);
+        console.log('[Extraction] ERP match:', erpCompany.name);
+        const combinedText = pdfText + '\n' + ocrText;
 
-        const combinedSearchText = pdfText + '\n' + ocrText;
-        console.log('Searching in combined text (digital + OCR), total length:', combinedSearchText.length);
-
-        if (isCompanyNameInText(erpCompany.name, combinedSearchText)) {
-          console.log('Official ERP name found in text - updating vendorName');
-          console.log('Replacing:', extractedData.vendorName, '→', erpCompany.name);
+        if (isCompanyNameInText(erpCompany.name, combinedText)) {
+          console.log('[Extraction] Updating vendor name to ERP name');
           extractedData.vendorName = erpCompany.name;
-        } else {
-          console.log('Official ERP name NOT found in combined text - keeping extracted name');
         }
-      } else {
-        console.log('Tax ID not found in ERP - keeping extracted vendor name');
       }
     }
 
-    console.log('Final Vendor:', extractedData.vendorName, 'Tax ID:', extractedData.vendorTaxId);
-
     return {
       data: extractedData,
-      confidence: calculateConfidence(extractedData),
-      rawResponse,
+      confidence,
+      rawResponse: JSON.stringify(extractedData, null, 2),
     };
   } catch (error) {
-    console.error('Extraction error:', error);
+    console.error('[Extraction] Error:', error);
     return {
       data: null,
       confidence: 0,
@@ -518,6 +784,9 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
   }
 }
 
+/**
+ * Extraction with retry
+ */
 export async function extractInvoiceDataWithRetry(
   pdfBuffer: Buffer,
   maxRetries: number = 2
@@ -538,7 +807,6 @@ export async function extractInvoiceDataWithRetry(
 
     lastError = result.error;
 
-    // Wait before retry (exponential backoff)
     if (attempt < maxRetries) {
       await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
     }
