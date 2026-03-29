@@ -177,7 +177,7 @@ invoice-processing-pipeline/
 ```env
 # ERP API Configuration
 ERP_API_KEY=your-erp-api-key
-ERP_API_BASE_URL=https://backend-production-4c89.up.railway.app/api/erp
+ERP_API_BASE_URL=<contact-admin-for-url>
 
 # Authentication
 AUTH_SECRET=your-random-secret-key
