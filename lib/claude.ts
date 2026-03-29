@@ -1,14 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import pdf from 'pdf-parse';
 import type { ExtractedData } from './types';
 import { findCompanyByTaxId, isCompanyNameInText } from './erp-api';
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL || 'https://api.z.ai/api/anthropic',
-});
-
-const MODEL = process.env.ANTHROPIC_MODEL || 'glm-5';
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
 /**
  * Main extraction prompt for digital text (Pass 1)
@@ -52,7 +48,7 @@ Look for labels: "VAT", "VAT/TIN", "BTW", "GSTIN", "Tax ID", "TVA", "VAT Number"
 - Do not skip any items regardless of their value.
 
 === REQUIRED JSON OUTPUT ===
-Return ONLY a JSON object with these exact field names:
+Return ONLY a JSON object with these exact field names. Do NOT use markdown code blocks. Return raw JSON only:
 {
   "invoiceNumber": "string (exact value, do not strip prefixes)",
   "vendorName": "string",
@@ -90,18 +86,42 @@ RULES FOR TAX ID:
 3. Do NOT extract "Uw BTW nummer" or "Your VAT" - those are customer Tax IDs.
 4. Return null if not found.
 
-RETURN ONLY this JSON (no markdown, no explanation):
+RETURN ONLY raw JSON (no markdown, no code blocks, no explanation):
 {"vendorName": "string", "vendorTaxId": "string or null"}
 
 OCR TEXT:
 `;
 
 /**
- * Parse JSON from Claude response, handling markdown code blocks
+ * Call Gemini API to extract structured data
+ */
+async function callGemini(prompt: string): Promise<string> {
+  try {
+    const model = genAI.getGenerativeModel({ model: MODEL });
+
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 4096,
+      },
+    });
+
+    const response = result.response;
+    return response.text();
+  } catch (error) {
+    console.error('Gemini API error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Parse JSON from Gemini response, handling markdown code blocks
  */
 function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
   try {
     let jsonStr = rawResponse.trim();
+    // Handle markdown code blocks
     if (jsonStr.startsWith('```json')) {
       jsonStr = jsonStr.slice(7);
     } else if (jsonStr.startsWith('```')) {
@@ -113,6 +133,7 @@ function parseJsonFromResponse(rawResponse: string): ExtractedData | null {
     jsonStr = jsonStr.trim();
     return JSON.parse(jsonStr) as ExtractedData;
   } catch {
+    console.error('Failed to parse JSON from response:', rawResponse.substring(0, 200));
     return null;
   }
 }
@@ -138,6 +159,7 @@ function parseOcrPatchResponse(rawResponse: string): { vendorName: string | null
       vendorTaxId: parsed.vendorTaxId || null,
     };
   } catch {
+    console.error('Failed to parse OCR patch response:', rawResponse.substring(0, 200));
     return null;
   }
 }
@@ -246,24 +268,9 @@ async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName:
   try {
     console.log('Extracting vendor patch from OCR text...');
 
-    const message = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 256,
-      messages: [
-        {
-          role: 'user',
-          content: OCR_PATCH_PROMPT + '\n\n' + ocrText,
-        },
-      ],
-    });
+    const response = await callGemini(OCR_PATCH_PROMPT + '\n\n' + ocrText);
 
-    const textBlock = message.content.find((block) => block.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') {
-      console.error('No text response from OCR patch extraction');
-      return null;
-    }
-
-    const patch = parseOcrPatchResponse(textBlock.text);
+    const patch = parseOcrPatchResponse(response);
     if (patch) {
       console.log('OCR patch extracted:', patch);
     }
@@ -277,9 +284,9 @@ async function extractVendorPatchFromOcr(ocrText: string): Promise<{ vendorName:
 /**
  * Extract invoice data using Targeted Field Patching architecture
  *
- * PASS 1: Full digital extraction (pdf-parse → GLM-5)
+ * PASS 1: Full digital extraction (pdf-parse → Gemini)
  * VALIDATION: Check if vendorName/vendorTaxId need patching
- * PASS 2: If needed, OCR → GLM-5 (vendor only) → patch original JSON
+ * PASS 2: If needed, OCR → Gemini (vendor only) → patch original JSON
  * POST-PROCESSING: Validate vendor name against ERP using Tax ID
  * RETURN: Merged result with perfect financial data + patched vendor info
  */
@@ -309,29 +316,10 @@ export async function extractInvoiceData(pdfBuffer: Buffer): Promise<{
 
     console.log('Digital text length:', pdfText.length);
 
-    // Send digital text to GLM-5 with full extraction prompt
-    const message = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 4096,
-      messages: [
-        {
-          role: 'user',
-          content: EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY a valid JSON object with no additional text or markdown formatting.',
-        },
-      ],
-    });
+    // Send digital text to Gemini with full extraction prompt
+    const fullPrompt = EXTRACTION_PROMPT + '\n\n' + pdfText + '\n\nReturn ONLY raw JSON with no markdown formatting or code blocks.';
+    const rawResponse = await callGemini(fullPrompt);
 
-    const textBlock = message.content.find((block) => block.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') {
-      return {
-        data: null,
-        confidence: 0,
-        rawResponse: '',
-        error: 'No text response from Claude',
-      };
-    }
-
-    const rawResponse = textBlock.text;
     let extractedData = parseJsonFromResponse(rawResponse);
 
     if (!extractedData) {
